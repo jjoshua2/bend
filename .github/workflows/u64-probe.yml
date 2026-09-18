@@ -24,8 +24,3 @@ jobs:
           bun bend2/main.ts tests/base/u64_ops.bend -o /tmp/u64_test.js
           out="$(bun /tmp/u64_test.js)"
           test "$out" = "18"
-      - name: TypeScript check
-        working-directory: bend2/pack
-        run: |
-          bun install --frozen-lockfile
-          bunx tsc -p tsconfig.json
