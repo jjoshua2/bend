@@ -54,6 +54,9 @@ type Word.Con<-p: Nat> is Data:
 type U32 is Data:
   U32{data: Word(32n)}
 
+type U64 is Data:
+  U64{lo: U32, hi: U32}
+
 type F32 is Data:
   F32{data: Word(32n)}
 
@@ -1251,6 +1254,28 @@ def Word.mul.go(+n: Nat, m: Nat, a: Word(m), +b: Word(n), acc: Word(n)) ->
 def Word.mul(+n: Nat, a: Word(n), b: Word(n)) -> Word(n):
   Word.mul.go(n, n, a, b, Word.zero(n))
 
+def Word.popcount(n: Nat, w: Word(n), acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      match w:
+        case WCon{False{}, t}:
+          Word.popcount(p, t, acc)
+        case WCon{True{}, t}:
+          Word.popcount(p, t, U32.inc(acc))
+
+def Word.ctz(n: Nat, w: Word(n), acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      match w:
+        case WCon{False{}, t}:
+          Word.ctz(p, t, U32.inc(acc))
+        case WCon{True{}, t}:
+          acc
+
 # U32
 # ---
 
@@ -1442,6 +1467,163 @@ def U32.pow(+a: U32, n: Nat) -> U32:
 
 def U32.is_even(a: U32) -> Bool:
   U32.is_zero(U32.and(a, 1))
+
+# U64
+# ---
+
+def U64.zero() -> U64:
+  U64{0, 0}
+
+def U64.one() -> U64:
+  U64{1, 0}
+
+def U64.from_u32(lo: U32) -> U64:
+  U64{lo, 0}
+
+def U64.from_parts(hi: U32, lo: U32) -> U64:
+  U64{lo, hi}
+
+def U64.low(a: U64) -> U32:
+  match a:
+    case U64{lo, hi}:
+      lo
+
+def U64.high(a: U64) -> U32:
+  match a:
+    case U64{lo, hi}:
+      hi
+
+def U64.inc(a: U64) -> U64:
+  U64.add(a, U64.one())
+
+def U64.add(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{+alo, ahi} U64{blo, bhi}:
+      +lo = U32.add(alo, blo)
+      carry = Bool.to_u32(U32.is_lt(lo, alo))
+      U64{lo, U32.add(U32.add(ahi, bhi), carry)}
+
+def U64.sub(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{+alo, ahi} U64{+blo, bhi}:
+      borrow = Bool.to_u32(U32.is_lt(alo, blo))
+      U64{U32.sub(alo, blo), U32.sub(U32.sub(ahi, bhi), borrow)}
+
+def U64.not(a: U64) -> U64:
+  match a:
+    case U64{lo, hi}:
+      U64{U32.not(lo), U32.not(hi)}
+
+def U64.and(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{alo, ahi} U64{blo, bhi}:
+      U64{U32.and(alo, blo), U32.and(ahi, bhi)}
+
+def U64.or(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{alo, ahi} U64{blo, bhi}:
+      U64{U32.or(alo, blo), U32.or(ahi, bhi)}
+
+def U64.xor(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{alo, ahi} U64{blo, bhi}:
+      U64{U32.xor(alo, blo), U32.xor(ahi, bhi)}
+
+def U64.shl(a: U64) -> U64:
+  match a:
+    case U64{+lo, hi}:
+      U64{U32.shl(lo), U32.or(U32.shl(hi), U32.shrn(lo, 31n))}
+
+def U64.shr(a: U64) -> U64:
+  match a:
+    case U64{lo, +hi}:
+      U64{U32.or(U32.shr(lo), U32.shln(hi, 31n)), U32.shr(hi)}
+
+def U64.shln(a: U64, n: Nat) -> U64:
+  match n:
+    case 0n:
+      a
+    case 1n+p:
+      U64.shl(U64.shln(a, p))
+
+def U64.shrn(a: U64, n: Nat) -> U64:
+  match n:
+    case 0n:
+      a
+    case 1n+p:
+      U64.shr(U64.shrn(a, p))
+
+def U64.cmp.fin(alo: U32, blo: U32, hi: Cmp) -> Cmp:
+  match hi:
+    case LT{}:
+      LT{}
+    case EQ{}:
+      U32.cmp(alo, blo)
+    case GT{}:
+      GT{}
+
+def U64.cmp(a: U64, b: U64) -> Cmp:
+  match a b:
+    case U64{alo, ahi} U64{blo, bhi}:
+      U64.cmp.fin(alo, blo, U32.cmp(ahi, bhi))
+
+def U64.is_eq(a: U64, b: U64) -> Bool:
+  Cmp.is_eq(U64.cmp(a, b))
+
+def U64.is_ne(a: U64, b: U64) -> Bool:
+  Bool.not(U64.is_eq(a, b))
+
+def U64.is_lt(a: U64, b: U64) -> Bool:
+  Cmp.is_lt(U64.cmp(a, b))
+
+def U64.is_le(a: U64, b: U64) -> Bool:
+  Cmp.is_le(U64.cmp(a, b))
+
+def U64.is_gt(a: U64, b: U64) -> Bool:
+  Cmp.is_gt(U64.cmp(a, b))
+
+def U64.is_ge(a: U64, b: U64) -> Bool:
+  Cmp.is_ge(U64.cmp(a, b))
+
+def U64.is_zero(a: U64) -> Bool:
+  match a:
+    case U64{lo, hi}:
+      Bool.and(U32.is_zero(lo), U32.is_zero(hi))
+
+def U64.is_odd(a: U64) -> Bool:
+  match a:
+    case U64{lo, hi}:
+      Bool.not(U32.is_even(lo))
+
+def U64.bit(n: Nat) -> U64:
+  U64.shln(U64.one(), n)
+
+def U64.test_bit(a: U64, n: Nat) -> Bool:
+  U64.is_ne(U64.and(a, U64.bit(n)), U64.zero())
+
+def U64.lsb(+a: U64) -> U64:
+  U64.and(a, U64.sub(U64.zero(), a))
+
+def U64.popcount(a: U64) -> U32:
+  match a:
+    case U64{U32{lo}, U32{hi}}:
+      U32.add(Word.popcount(32n, lo, 0), Word.popcount(32n, hi, 0))
+
+def U64.ctz.go(n: Nat, lo: Word(n), hi: Word(32n), acc: U32) -> U32:
+  match n:
+    case 0n:
+      Word.ctz(32n, hi, acc)
+    case 1n+p:
+      match lo:
+        case WCon{False{}, t}:
+          U64.ctz.go(p, t, hi, U32.inc(acc))
+        case WCon{True{}, t}:
+          acc
+
+def U64.ctz(a: U64) -> U32:
+  match a:
+    case U64{U32{lo}, U32{hi}}:
+      U64.ctz.go(32n, lo, hi, 0)
 
 # F32
 # ---
