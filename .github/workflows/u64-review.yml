@@ -1,0 +1,27 @@
+name: U64 review
+on:
+  push:
+    branches: [feat/u64]
+    paths: ['.github/workflows/u64-review.yml', '.github/u64-review.patch']
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - name: Package source and test runtime (no credentials)
+        run: |
+          mkdir -p /tmp/u64-snapshot
+          tar -czf /tmp/u64-snapshot/source.tgz bend2 guide tests gates AGENTS.md README.md
+          cp "$(command -v bun)" /tmp/u64-snapshot/bun
+          git rev-parse HEAD > /tmp/u64-snapshot/revision.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u64-review-source
+          path: /tmp/u64-snapshot/
+          retention-days: 2
