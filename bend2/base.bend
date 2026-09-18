@@ -1493,15 +1493,15 @@ def U64.high(a: U64) -> U32:
     case U64{lo, hi}:
       hi
 
-def U64.inc(a: U64) -> U64:
-  U64.add(a, U64.one())
-
 def U64.add(a: U64, b: U64) -> U64:
   match a b:
     case U64{+alo, ahi} U64{blo, bhi}:
       +lo = U32.add(alo, blo)
       carry = Bool.to_u32(U32.is_lt(lo, alo))
       U64{lo, U32.add(U32.add(ahi, bhi), carry)}
+
+def U64.inc(a: U64) -> U64:
+  U64.add(a, U64.one())
 
 def U64.sub(a: U64, b: U64) -> U64:
   match a b:
