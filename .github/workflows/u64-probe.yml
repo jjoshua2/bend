@@ -31,6 +31,6 @@ jobs:
         working-directory: bend2/pack
         run: |
           bun install --frozen-lockfile
-          bunx tsc --noEmit --strict --target es2022 --module esnext \
+          bunx tsc --ignoreConfig --noEmit --strict --target es2022 --module esnext \
             --moduleResolution bundler --allowImportingTsExtensions \
             --skipLibCheck --types bun ../bend.ts ../comp.ts
