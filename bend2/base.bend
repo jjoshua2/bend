@@ -1539,19 +1539,26 @@ def U64.shr(a: U64) -> U64:
     case U64{lo, +hi}:
       U64{U32.or(U32.shr(lo), U32.shln(hi, 31n)), U32.shr(hi)}
 
-def U64.shln(a: U64, n: Nat) -> U64:
+def U64.shln.go(n: Nat, a: U64) -> U64:
   match n:
     case 0n:
       a
     case 1n+p:
-      U64.shl(U64.shln(a, p))
+      U64.shl(U64.shln.go(p, a))
+
+def U64.shrn.go(n: Nat, a: U64) -> U64:
+  match n:
+    case 0n:
+      a
+    case 1n+p:
+      U64.shr(U64.shrn.go(p, a))
+
+# Saturating shift counts: no lane iterates an unbounded user count.
+def U64.shln(a: U64, n: Nat) -> U64:
+  U64.shln.go(Nat.min(n, 64n), a)
 
 def U64.shrn(a: U64, n: Nat) -> U64:
-  match n:
-    case 0n:
-      a
-    case 1n+p:
-      U64.shr(U64.shrn(a, p))
+  U64.shrn.go(Nat.min(n, 64n), a)
 
 def U64.cmp.fin(alo: U32, blo: U32, hi: Cmp) -> Cmp:
   match hi:
@@ -1624,6 +1631,84 @@ def U64.ctz(a: U64) -> U32:
   match a:
     case U64{U32{lo}, U32{hi}}:
       U64.ctz.go(32n, lo, hi, 0)
+
+# High half of a 32x32 product, using bounded 16-bit partial products.
+# Each intermediate sum fits U32; the outer U64 product wraps modulo 2^64.
+def U64.mul.high32(+a: U32, +b: U32) -> U32:
+  +a0 = U32.and(a, 65535)
+  +a1 = U32.shrn(a, 16n)
+  +b0 = U32.and(b, 65535)
+  +b1 = U32.shrn(b, 16n)
+  w0 = U32.mul(a0, b0)
+  +t = U32.add(U32.mul(a1, b0), U32.shrn(w0, 16n))
+  w1 = U32.add(U32.mul(a0, b1), U32.and(t, 65535))
+  U32.add(U32.add(U32.mul(a1, b1), U32.shrn(t, 16n)), U32.shrn(w1, 16n))
+
+def U64.mul(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{+alo, ahi} U64{+blo, bhi}:
+      hi = U32.add(U64.mul.high32(alo, blo),
+        U32.add(U32.mul(ahi, blo), U32.mul(alo, bhi)))
+      U64{U32.mul(alo, blo), hi}
+
+# a & ~b (the opposite operand order from x86's ANDN intrinsic).
+def U64.and_not(a: U64, b: U64) -> U64:
+  U64.and(a, U64.not(b))
+
+def U64.clear_lsb(+a: U64) -> U64:
+  U64.and(a, U64.sub(a, U64.one()))
+
+def U64.set_bit(a: U64, n: Nat) -> U64:
+  U64.or(a, U64.bit(n))
+
+def U64.clear_bit(a: U64, n: Nat) -> U64:
+  U64.and_not(a, U64.bit(n))
+
+def U64.toggle_bit(a: U64, n: Nat) -> U64:
+  U64.xor(a, U64.bit(n))
+
+def U64.popcnt(a: U64) -> U32:
+  U64.popcount(a)
+
+def U64.clz.go(n: Nat, +a: U64, acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      U64.clz.go(p, U64.shr(a), Bool.pick(U32, U64.is_odd(a), 0, U32.inc(acc)))
+
+# clz(0) = ctz(0) = 64; lsb(0) = clear_lsb(0) = 0.
+def U64.clz(a: U64) -> U32:
+  U64.clz.go(64n, a, 0)
+
+# PEXT gathers mask-selected bits, low to high, into consecutive low bits.
+# These terminating definitions are the interpreter/JS/proof semantics.
+# C replaces the public calls with BMI2 or a portable set-bit walk.
+def U64.pext.go(n: Nat, +a: U64, +mask: U64, +bit: U64, acc: U64) -> U64:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      U64.pext.go(p, U64.shr(a), U64.shr(mask),
+        Bool.pick(U64, U64.is_odd(mask), U64.shl(bit), bit),
+        U64.or(acc, Bool.pick(U64, U64.is_odd(U64.and(a, mask)), bit, U64.zero())))
+
+def U64.pext(a: U64, mask: U64) -> U64:
+  U64.pext.go(64n, a, mask, U64.one(), U64.zero())
+
+# PDEP scatters consecutive low bits into mask-selected positions.
+def U64.pdep.go(n: Nat, +a: U64, +mask: U64, +bit: U64, acc: U64) -> U64:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      U64.pdep.go(p, Bool.pick(U64, U64.is_odd(mask), U64.shr(a), a),
+        U64.shr(mask), U64.shl(bit),
+        U64.or(acc, Bool.pick(U64, Bool.and(U64.is_odd(a), U64.is_odd(mask)),
+          bit, U64.zero())))
+
+def U64.pdep(a: U64, mask: U64) -> U64:
+  U64.pdep.go(64n, a, mask, U64.one(), U64.zero())
 
 # F32
 # ---
