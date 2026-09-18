@@ -444,17 +444,77 @@ def main() -> String:
   U32.show(a) ++ " = " ++ Nat.show(b)
 ```
 
-Every def is named `Type.verb`, and the same verbs recur across `Nat`, `U32`
-and `F32`: `add sub mul div mod` for arithmetic, `and or xor not shl shr` for
-bits (`U32` only), `cmp` (returning `Cmp`, not on `F32`) and `is_eq is_ne is_lt
-is_le is_gt is_ge` (returning `Bool`) for comparisons, `show` to `String` and
-`read` back from it (answering a `Maybe`). Operators and `<`-style comparisons
-are just sugar for these. Beyond numbers there are `Bool`, `Cmp`, `Maybe`,
-`Result`, `List`, `Array`, a string-keyed `Map` (`new set get has del keys`;
-`get` takes a default, and `get` and `has` hand the map back beside their
-result), `Set` on top of it, the `Equal` lemmas, and the effects. `bend base`
-prints all of it, `bend base --types` only the types, and `bend base Map` one
-name and everything under it.
+Every def is named `Type.verb`. `Nat`, `U32` and `F32` provide the usual
+arithmetic families. `U64` provides wrapping `add sub mul`, bitwise
+`and or xor not and_not`, comparisons and the bit helpers below. Operators
+are sugar for the corresponding named defs. Beyond numbers there are `Bool`,
+`Cmp`, `Maybe`, `Result`, `List`, `Array`, a string-keyed `Map`, `Set`, the
+`Equal` lemmas and effects. `bend base` prints the library, `bend base --types`
+only the types, and `bend base U64` the U64 family.
+
+#### U64 bitboards
+
+`U64{lo: U32, hi: U32}` stores all 64 bits safely in flat records, arrays,
+shared lists and closures. There is no U64 literal syntax: use
+`U64.from_u32(x)` or **`U64.from_parts(hi, lo)`** (high part first).
+The C compiler fuses scalar operations through native unsigned 64-bit
+arithmetic without exposing raw high bits to the tagged runtime.
+
+```python
+import Base
+
+def slider_index(occupied: U64, mask: U64) -> U32:
+  U64.low(U64.pext(occupied, mask))
+
+def magic_index(occupied: U64, mask: U64, magic: U64, shift: Nat) -> U32:
+  U64.low(U64.shrn(U64.mul(U64.and(occupied, mask), magic), shift))
+```
+
+`pext(x, mask)` packs the selected bits of x into consecutive low bits, in
+low-to-high order. `pdep(x, mask)` scatters consecutive low bits into the
+mask's set positions; other bits are zero. Both accept every mask, including
+zero and all ones. They return U64; take `low` for a small table index.
+
+`popcount` (also `popcnt`) counts set bits. `ctz` and `clz` return U32 and
+return **64 on zero**. `lsb` isolates the lowest set bit; `clear_lsb` removes
+it; both return zero on zero. `and_not(a, b)` means **a & ~b**, not ~a & b.
+`shl/shr` shift once and `shln/shrn` take a Nat count: counts >= 64 return
+zero. `bit(n)` is zero for n >= 64; `test_bit` is false there, while
+`set_bit`, `clear_bit` and `toggle_bit` leave the value unchanged. `add`,
+`sub`, `inc` and `mul` wrap modulo 2^64.
+
+A generic x86-64 C build runtime-dispatches PEXT/PDEP and POPCNT only when
+supported. A native-target build uses direct instructions, avoiding dispatch
+in the hot loop. Other CPUs and the device lane have portable helpers; the
+checker and JS retain the terminating Base definitions. BMI2 support is not
+itself a promise of fast PEXT on every CPU: benchmark against magic indexing,
+particularly on older AMD CPUs. The two indexing schemes require their own
+table layout; they cannot be substituted after a table has been built.
+
+```bash
+bend chess.bend -o chess.c
+clang -O3 -std=c11 chess.c -pthread -lm -o chess          # generic dispatch
+clang -O3 -std=c11 -march=native chess.c -pthread -lm -o chess-native
+clang -O3 -std=c11 -DBEND_U64_PORTABLE chess.c -pthread -lm -o chess-portable
+```
+
+`-march=native` restricts the binary to compatible CPUs. `BEND_U64_PORTABLE`
+disables U64 hardware-specific paths for testing or deployment; it does not
+undo other architecture-specific compiler flags. Explicit AVX2 vector types
+or batched SIMD APIs are not part of this scalar U64 interface.
+
+For focused validation without the project's cluster:
+
+```bash
+bun tests/run/u64_verify.js --regressions
+BENCH_N=20000000 bun tests/run/u64_verify.js --bench
+```
+
+The benchmark is opt-in, compares generated Bend C with a C twin on the same
+machine, and verifies their checksums. It measures a bitboard primitive loop,
+not a chess engine or perft. The validation script checks generated C/JS
+against an independent BigInt oracle, forces portable paths, runs UBSan,
+and checks the x86 instruction output where available.
 
 ### Modules
 
