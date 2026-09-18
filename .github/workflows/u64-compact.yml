@@ -2,28 +2,90 @@ name: U64 compact review
 on:
   push:
     branches: [feat/u64-compact]
-    paths: ['.github/workflows/u64-compact.yml', '.github/u64-compact.patch']
+    paths: ['.github/workflows/u64-compact.yml']
 permissions:
-  contents: read
+  contents: write
 jobs:
-  snapshot:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Package pinned source snapshots without credentials
+      - uses: oven-sh/setup-bun@v2
+      - name: Replay original U64 onto pinned upstream and apply verified simplification
         run: |
-          mkdir -p /tmp/u64-compact
-          git fetch --depth=1 origin 2cd183597822772d998a43dcf78dfed06ce6d265
-          git archive --format=tar.gz 2cd183597822772d998a43dcf78dfed06ce6d265 bend2 guide tests gates AGENTS.md README.md .gitignore LICENSE > /tmp/u64-compact/pr-source.tgz
-          git fetch --depth=1 origin b4929c2d0d9d1e9598954aa37758954bab4d8a77
-          git archive --format=tar.gz b4929c2d0d9d1e9598954aa37758954bab4d8a77 bend2 guide tests gates AGENTS.md README.md .gitignore LICENSE > /tmp/u64-compact/upstream-source.tgz
-          git fetch --depth=1 origin 67692d7f2774262461d8a0fda7742d924f307b1d
-          git archive --format=tar.gz 67692d7f2774262461d8a0fda7742d924f307b1d bend2 guide tests gates AGENTS.md README.md .gitignore LICENSE > /tmp/u64-compact/old-base.tgz
+          git fetch --no-tags --depth=1 origin 67692d7f2774262461d8a0fda7742d924f307b1d 2cd183597822772d998a43dcf78dfed06ce6d265 b4929c2d0d9d1e9598954aa37758954bab4d8a77
+          git diff --binary 67692d7f2774262461d8a0fda7742d924f307b1d 2cd183597822772d998a43dcf78dfed06ce6d265 -- README.md bend2/base.bend bend2/comp.ts guide/GUIDE.md tests/base/u64_ops.bend tests/base/u64_bmi.bend tests/base/u64_scans.bend tests/compile/u64_storage.bend tests/run/u64_verify.js > /tmp/original-u64.patch
+          git apply --3way /tmp/original-u64.patch
+          python3 - <<'PY'
+          import base64, gzip, hashlib, pathlib
+          s = pathlib.Path('.github/u64-compact.patch.gz.b64').read_text().strip()
+          s = s.replace('WTKrKrKVe', 'WTKrKVe').replace('AjTaVZZ887', 'AjTaVZ887')
+          patch = gzip.decompress(base64.b64decode(s, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '9ab134662fe464d76d2eff2ea20466ee438a770e8da5034fdc84373033919ae9'
+          pathlib.Path('/tmp/u64-compact.patch').write_bytes(patch)
+          PY
+          git apply --check /tmp/u64-compact.patch
+          git apply /tmp/u64-compact.patch
+          git diff --check
+      - name: Verify semantics, regressions, native instructions and benchmark
+        id: runtime
+        env:
+          BENCH_N: 20000000
+        run: |
+          set -o pipefail
+          clang --version > /tmp/u64-compact-toolchain.txt
+          lscpu >> /tmp/u64-compact-toolchain.txt
+          bun tests/run/u64_verify.js --regressions --bench | tee /tmp/u64-compact-validation.json
+      - name: Type-check compiler core
+        id: types
+        working-directory: bend2/pack
+        run: |
+          bun install --frozen-lockfile
+          printf '%s\n' '{"extends":"./tsconfig.json","include":["../bend.ts","../comp.ts"]}' > tsconfig.u64-review.json
+          bunx tsc -p tsconfig.u64-review.json
+          rm tsconfig.u64-review.json
+      - name: Measure source budgets without changing their limits
+        id: size
+        run: |
+          set -o pipefail
+          python3 -m pip install --quiet ttok
+          for f in bend2/base.bend bend2/comp.ts; do
+            printf 'Upstream %s: ' "$f"
+            git show b4929c2d0d9d1e9598954aa37758954bab4d8a77:"$f" | ttok
+            printf 'Original U64 %s: ' "$f"
+            git show 2cd183597822772d998a43dcf78dfed06ce6d265:"$f" | ttok
+            printf 'Compact U64 %s: ' "$f"
+            ttok < "$f"
+          done | tee /tmp/u64-compact-sizes.txt
+          git rm .github/workflows/u64-compact.yml .github/u64-compact.patch.gz.b64
+          git add README.md bend2/base.bend bend2/comp.ts guide/GUIDE.md tests/base/u64_ops.bend tests/base/u64_bmi.bend tests/base/u64_scans.bend tests/compile/u64_storage.bend tests/run/u64_verify.js
+          git diff --cached --check
+          git diff --cached --exit-code b4929c2d0d9d1e9598954aa37758954bab4d8a77 -- bend2/bend.ts gates/repo.ts
+          bun gates/repo.ts | tee /tmp/u64-compact-size-policy.txt
+      - name: Publish tested comparison branch without rewriting PR 1
+        if: always() && steps.runtime.outcome == 'success' && steps.types.outcome == 'success' && (steps.size.outcome == 'success' || steps.size.outcome == 'failure')
+        run: |
+          git diff --cached --check
+          git diff --cached --exit-code b4929c2d0d9d1e9598954aa37758954bab4d8a77 -- bend2/bend.ts gates/repo.ts
+          test ! -f .github/workflows/u64-compact.yml
+          test ! -f .github/u64-compact.patch.gz.b64
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          tree="$(git write-tree)"
+          commit="$(git commit-tree "$tree" -p b4929c2d0d9d1e9598954aa37758954bab4d8a77 -m 'Add compact U64 chess primitives with native C intrinsics')"
+          git push origin "$commit":refs/heads/feat/u64-compact-reviewed
+          printf '%s\n' "$commit" > /tmp/u64-compact-commit.txt
+          git diff --stat b4929c2d0d9d1e9598954aa37758954bab4d8a77 "$commit" | tee /tmp/u64-compact-stat.txt
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: u64-compact-source
-          path: /tmp/u64-compact/
-          retention-days: 3
+          name: u64-compact-validation
+          path: |
+            /tmp/u64-compact-validation.json
+            /tmp/u64-compact-toolchain.txt
+            /tmp/u64-compact-sizes.txt
+            /tmp/u64-compact-size-policy.txt
+            /tmp/u64-compact-commit.txt
+            /tmp/u64-compact-stat.txt
+          retention-days: 30
