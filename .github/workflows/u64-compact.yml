@@ -1,0 +1,29 @@
+name: U64 compact review
+on:
+  push:
+    branches: [feat/u64-compact]
+    paths: ['.github/workflows/u64-compact.yml', '.github/u64-compact.patch']
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Package pinned source snapshots without credentials
+        run: |
+          mkdir -p /tmp/u64-compact
+          git fetch --depth=1 origin 2cd183597822772d998a43dcf78dfed06ce6d265
+          git archive --format=tar.gz 2cd183597822772d998a43dcf78dfed06ce6d265 bend2 guide tests gates AGENTS.md README.md .gitignore LICENSE > /tmp/u64-compact/pr-source.tgz
+          git fetch --depth=1 origin b4929c2d0d9d1e9598954aa37758954bab4d8a77
+          git archive --format=tar.gz b4929c2d0d9d1e9598954aa37758954bab4d8a77 bend2 guide tests gates AGENTS.md README.md .gitignore LICENSE > /tmp/u64-compact/upstream-source.tgz
+          git fetch --depth=1 origin 67692d7f2774262461d8a0fda7742d924f307b1d
+          git archive --format=tar.gz 67692d7f2774262461d8a0fda7742d924f307b1d bend2 guide tests gates AGENTS.md README.md .gitignore LICENSE > /tmp/u64-compact/old-base.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u64-compact-source
+          path: /tmp/u64-compact/
+          retention-days: 3
