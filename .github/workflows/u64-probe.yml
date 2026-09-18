@@ -1,0 +1,36 @@
+name: U64 probe
+
+on:
+  push:
+    branches: [feat/u64]
+
+jobs:
+  u64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Check and interpret
+        run: |
+          out="$(bun bend2/main.ts tests/base/u64_ops.bend)"
+          test "$out" = "18"
+      - name: Build and run C
+        run: |
+          bun bend2/main.ts tests/base/u64_ops.bend -o /tmp/u64_test.c
+          test "$(grep -c 'u64_popcount(' /tmp/u64_test.c)" -ge 2
+          test "$(grep -c 'u64_ctz(' /tmp/u64_test.c)" -ge 2
+          bun bend2/main.ts tests/base/u64_ops.bend -o /tmp/u64_test
+          out="$(/tmp/u64_test)"
+          test "$out" = "18"
+      - name: Build and run JavaScript
+        run: |
+          bun bend2/main.ts tests/base/u64_ops.bend -o /tmp/u64_test.js
+          out="$(bun /tmp/u64_test.js)"
+          test "$out" = "18"
+      - name: Type-check compiler core
+        working-directory: bend2/pack
+        run: |
+          bun install --frozen-lockfile
+          bunx tsc --noEmit --strict --target es2022 --module esnext \
+            --moduleResolution bundler --allowImportingTsExtensions \
+            --skipLibCheck --types bun ../bend.ts ../comp.ts
