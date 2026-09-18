@@ -1254,28 +1254,6 @@ def Word.mul.go(+n: Nat, m: Nat, a: Word(m), +b: Word(n), acc: Word(n)) ->
 def Word.mul(+n: Nat, a: Word(n), b: Word(n)) -> Word(n):
   Word.mul.go(n, n, a, b, Word.zero(n))
 
-def Word.popcount(n: Nat, w: Word(n), acc: U32) -> U32:
-  match n:
-    case 0n:
-      acc
-    case 1n+p:
-      match w:
-        case WCon{False{}, t}:
-          Word.popcount(p, t, acc)
-        case WCon{True{}, t}:
-          Word.popcount(p, t, U32.inc(acc))
-
-def Word.ctz(n: Nat, w: Word(n), acc: U32) -> U32:
-  match n:
-    case 0n:
-      acc
-    case 1n+p:
-      match w:
-        case WCon{False{}, t}:
-          Word.ctz(p, t, U32.inc(acc))
-        case WCon{True{}, t}:
-          acc
-
 # U32
 # ---
 
@@ -1467,6 +1445,28 @@ def U32.pow(+a: U32, n: Nat) -> U32:
 
 def U32.is_even(a: U32) -> Bool:
   U32.is_zero(U32.and(a, 1))
+
+def Word.popcount(n: Nat, w: Word(n), acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      match w:
+        case WCon{False{}, t}:
+          Word.popcount(p, t, acc)
+        case WCon{True{}, t}:
+          Word.popcount(p, t, U32.inc(acc))
+
+def Word.ctz(n: Nat, w: Word(n), acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      match w:
+        case WCon{False{}, t}:
+          Word.ctz(p, t, U32.inc(acc))
+        case WCon{True{}, t}:
+          acc
 
 # U64
 # ---
