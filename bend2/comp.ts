@@ -414,6 +414,35 @@ ${SHIMS}
 
 #define U32_BIN(a, o, b) ((u64)((u32)(a) o (u32)(b)))
 
+INLINE u64 u64_popcount(u64 x) {
+#if DEVICE
+  u64 n = 0;
+  for (u32 i = 0; i < 64; i += 1) {
+    n += x & 1;
+    x >>= 1;
+  }
+  return n;
+#else
+  return (u64)__builtin_popcountll((unsigned long long)x);
+#endif
+}
+
+INLINE u64 u64_ctz(u64 x) {
+  if (x == 0) {
+    return 64;
+  }
+#if DEVICE
+  u64 n = 0;
+  while ((x & 1) == 0) {
+    n += 1;
+    x >>= 1;
+  }
+  return n;
+#else
+  return (u64)__builtin_ctzll((unsigned long long)x);
+#endif
+}
+
 INLINE f32 f32_unbox(u64 x) {
   union { u32 u; f32 f; } p = { (u32)x };
   return p.f;
@@ -2149,6 +2178,97 @@ function emit_dst(fl: File, lay: Lay, k = "v"): Val {
   return val_new(emit_hold(fl, lay.ks.map(() => "0"), k, lay.ks), lay);
 }
 
+const U64_C = new Set([
+  "U64.from_u32", "U64.from_parts", "U64.low", "U64.high",
+  "U64.inc", "U64.add", "U64.sub", "U64.not", "U64.and", "U64.or",
+  "U64.xor", "U64.shl", "U64.shr", "U64.shln", "U64.shrn",
+  "U64.cmp", "U64.is_eq", "U64.is_ne", "U64.is_lt", "U64.is_le",
+  "U64.is_gt", "U64.is_ge", "U64.is_zero", "U64.is_odd", "U64.bit",
+  "U64.test_bit", "U64.lsb", "U64.popcount", "U64.ctz",
+]);
+
+// U64 stays two w32 words in Bend's runtime-safe layout. On the C lane,
+// fully applied scalar operations pack those words into a temporary native
+// u64, operate once, then split the result. This keeps recursive/boxed U64
+// values safe while giving bitboard-heavy code native arithmetic locally.
+function emit_u64_c(fl: File, x: HTerm, ty: HTerm | null): Val | null {
+  const m = term_spine(fl, x);
+  if (m.t.$ !== "Ref" || !U64_C.has(m.t.k)) {
+    return null;
+  }
+  const def = m.tld;
+  if (def?.$ !== "Def" || m.all.length !== def.n) {
+    return null;
+  }
+  const sig = sig_def(fl, m.t.k);
+  const args = emit_each(fl, m.args).map((v, i) =>
+    val_to(fl, v, sig.lays[i]));
+  const ret = lay_of(fl.book, ty ?? tele_unbind(fl.book, def.T).ret);
+  const scalar = (e: string): Val => val_new([e], ret);
+  const pair = (e: string): Val => {
+    const u = emit_alias(fl, e, "u", "w64");
+    return val_new([`((u32)${u})`, `((u32)(${u} >> 32))`], ret);
+  };
+  const small = (i: number): string =>
+    emit_alias(fl, val_word(args[i]), "a");
+  const wide = (i: number): string => {
+    if (args[i].ws.length !== 2) {
+      die("a U64 intrinsic argument outside its two-word layout");
+    }
+    const lo = emit_alias(fl, args[i].ws[0], "lo", "w32");
+    const hi = emit_alias(fl, args[i].ws[1], "hi", "w32");
+    return emit_alias(fl,
+      `((u64)(u32)${lo} | ((u64)(u32)${hi} << 32))`, "u", "w64");
+  };
+  const k = m.t.k;
+  if (k === "U64.from_u32") {
+    return val_new([small(0), "0"], ret);
+  }
+  if (k === "U64.from_parts") {
+    return val_new([small(1), small(0)], ret);
+  }
+  if (k === "U64.low" || k === "U64.high") {
+    return scalar(args[0].ws[k === "U64.low" ? 0 : 1]);
+  }
+  if (k === "U64.bit") {
+    const n = small(0);
+    return pair(`(${n} >= 64 ? 0ull : (1ull << ${n}))`);
+  }
+  const a = wide(0);
+  if (k === "U64.inc") return pair(`(${a} + 1ull)`);
+  if (k === "U64.not") return pair(`(~${a})`);
+  if (k === "U64.shl") return pair(`(${a} << 1)`);
+  if (k === "U64.shr") return pair(`(${a} >> 1)`);
+  if (k === "U64.is_zero") return scalar(`(${a} == 0)`);
+  if (k === "U64.is_odd") return scalar(`((${a} & 1) != 0)`);
+  if (k === "U64.lsb") return pair(`(${a} & (0ull - ${a}))`);
+  if (k === "U64.popcount") return scalar(`u64_popcount(${a})`);
+  if (k === "U64.ctz") return scalar(`u64_ctz(${a})`);
+  if (k === "U64.shln" || k === "U64.shrn") {
+    const n = small(1);
+    const op = k === "U64.shln" ? "<<" : ">>";
+    return pair(`(${n} >= 64 ? 0ull : (${a} ${op} ${n}))`);
+  }
+  if (k === "U64.test_bit") {
+    const n = small(1);
+    return scalar(`(${n} < 64 && ((${a} >> ${n}) & 1) != 0)`);
+  }
+  const b = wide(1);
+  if (k === "U64.add") return pair(`(${a} + ${b})`);
+  if (k === "U64.sub") return pair(`(${a} - ${b})`);
+  if (k === "U64.and") return pair(`(${a} & ${b})`);
+  if (k === "U64.or") return pair(`(${a} | ${b})`);
+  if (k === "U64.xor") return pair(`(${a} ^ ${b})`);
+  if (k === "U64.cmp") return scalar(`((${a} > ${b}) + (${a} >= ${b}))`);
+  if (k === "U64.is_eq") return scalar(`(${a} == ${b})`);
+  if (k === "U64.is_ne") return scalar(`(${a} != ${b})`);
+  if (k === "U64.is_lt") return scalar(`(${a} < ${b})`);
+  if (k === "U64.is_le") return scalar(`(${a} <= ${b})`);
+  if (k === "U64.is_gt") return scalar(`(${a} > ${b})`);
+  if (k === "U64.is_ge") return scalar(`(${a} >= ${b})`);
+  return null;
+}
+
 function emit_intr(fl: File, it: Intr, x: HTerm,
   ty: HTerm | null): Val {
   const m = term_spine(fl, x);
@@ -2327,6 +2447,10 @@ function emit_expr(fl: File, tm: HTerm, ty0: HTerm | null): Val {
     case "Var": return bind_pop(fl, x);
     case "Ref":
     case "App": {
+      const u64 = emit_u64_c(fl, x, ty);
+      if (u64 !== null) {
+        return u64;
+      }
       const got = emit_fold(fl, x);
       if (got !== null && got !== x) {
         const a = term_uses(fl, x);
@@ -2440,6 +2564,11 @@ function emit_body(fl: File, tm: HTerm, ty0: HTerm | null,
           ty ?? die("an untyped arm"), 1), ty, ers, args, dst);
       }
       fl.rest = [];
+      const u64 = emit_u64_c(fl, x, ty);
+      if (u64 !== null) {
+        bind_dead(fl, []);
+        return emit_put(fl, dst, u64);
+      }
       const ck = call_kind(fl, x);
       if (ck === null) {
         const v = emit_expr(fl, x, ty);
