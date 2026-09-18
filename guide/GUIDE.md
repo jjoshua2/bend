@@ -444,12 +444,13 @@ def main() -> String:
   U32.show(a) ++ " = " ++ Nat.show(b)
 ```
 
-Every def is named `Type.verb`, and the same verbs recur across `Nat`, `U32`
-and `F32`: `add sub mul div mod` for arithmetic, `and or xor not shl shr` for
-bits (`U32` only), `cmp` (returning `Cmp`, not on `F32`) and `is_eq is_ne is_lt
-is_le is_gt is_ge` (returning `Bool`) for comparisons, `show` to `String` and
-`read` back from it (answering a `Maybe`). Operators and `<`-style comparisons
-are just sugar for these. Beyond numbers there are `Bool`, `Cmp`, `Maybe`,
+Every def is named `Type.verb`, and the same verbs recur across the numeric
+types. `Nat`, `U32` and `F32` provide the usual arithmetic families. `U64`
+is a full-width two-word unsigned integer with `add sub`, `and or xor not`,
+`shl shr`, comparisons, and bit helpers including `bit`, `popcount`, `ctz`
+and `lsb`. Construct one with `U64.from_u32` or `U64.from_parts(hi, lo)`;
+there is no U64 literal syntax. Operators and `<`-style comparisons are sugar
+for the corresponding named defs where that family exists. Beyond numbers there are `Bool`, `Cmp`, `Maybe`,
 `Result`, `List`, `Array`, a string-keyed `Map` (`new set get has del keys`;
 `get` takes a default, and `get` and `has` hand the map back beside their
 result), `Set` on top of it, the `Equal` lemmas, and the effects. `bend base`
