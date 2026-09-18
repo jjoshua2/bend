@@ -62,6 +62,7 @@ type Src = { refs: Set<Bend.Name>; deps: Set<Bend.Name>; flat: boolean };
 
 type Carb = {
   book: Book;
+  js: boolean;
   bangs: Set<Bend.Name>;
   sites: Map<Bend.Name, number>;
   hot: Set<Bend.Name>;
@@ -124,6 +125,7 @@ type Call = {
 };
 
 type Intr = {
+  u64?: boolean;
   C?: Gen | string[];
   call?: boolean;
   JS: Gen;
@@ -416,6 +418,88 @@ ${SHIMS}
 #endif
 
 #define U32_BIN(a, o, b) ((u64)((u32)(a) o (u32)(b)))
+
+// BEND_U64_PORTABLE forces architecture-neutral helpers for testing/deployment.
+// Otherwise feature-targeted functions make generic x86-64 binaries safe,
+// while -mbmi2/-mpopcnt (or -march=native) removes hot-path dispatch entirely.
+#if !DEVICE && defined(__x86_64__) && !defined(BEND_U64_PORTABLE)
+#include <immintrin.h>
+#if !defined(__POPCNT__)
+__attribute__((target("popcnt"), noinline))
+static u64 u64_popcount_hw(u64 x) {
+  return (u64)__builtin_popcountll((unsigned long long)x);
+}
+#endif
+#endif
+
+INLINE u64 u64_popcount_soft(u64 x) {
+  x -= (x >> 1) & 0x5555555555555555ull;
+  x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
+  x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0full;
+  return (x * 0x0101010101010101ull) >> 56;
+}
+
+INLINE u64 u64_popcount(u64 x) {
+#if DEVICE || defined(BEND_U64_PORTABLE)
+  return u64_popcount_soft(x);
+#elif defined(__x86_64__) && !defined(__POPCNT__)
+  // Clang's CPU feature table is initialized once, not CPUID per call.
+  return __builtin_cpu_supports("popcnt") ? u64_popcount_hw(x)
+    : u64_popcount_soft(x);
+#else
+  return (u64)__builtin_popcountll((unsigned long long)x);
+#endif
+}
+
+INLINE u64 u64_ctz(u64 x) {
+  if (x == 0) return 64;
+#if DEVICE || defined(BEND_U64_PORTABLE)
+  // Isolate the low bit; it minus one has exactly ctz(x) set bits.
+  return u64_popcount_soft((x & (0ull - x)) - 1ull);
+#else
+  return (u64)__builtin_ctzll((unsigned long long)x);
+#endif
+}
+
+INLINE u64 u64_clz(u64 x) {
+  if (x == 0) return 64;
+#if DEVICE || defined(BEND_U64_PORTABLE)
+  x |= x >> 1; x |= x >> 2; x |= x >> 4;
+  x |= x >> 8; x |= x >> 16; x |= x >> 32;
+  return 64 - u64_popcount_soft(x);
+#else
+  return (u64)__builtin_clzll((unsigned long long)x);
+#endif
+}
+
+${["pext", "pdep"].map((op) => `
+#if !DEVICE && defined(__x86_64__) && !defined(BEND_U64_PORTABLE) && !defined(__BMI2__)
+__attribute__((target("bmi2"), noinline))
+static u64 u64_${op}_bmi2(u64 x, u64 m) { return _${op}_u64(x, m); }
+#endif
+
+INLINE u64 u64_${op}_soft(u64 x, u64 mask) {
+  u64 out = 0, bit = 1;
+  while (mask != 0) {
+    u64 low = mask & (0ull - mask);
+    if ((x & ${op === "pext" ? "low" : "bit"}) != 0) out |= ${op === "pext" ? "bit" : "low"};
+    mask &= mask - 1;
+    bit <<= 1;
+  }
+  return out;
+}
+
+INLINE u64 u64_${op}(u64 x, u64 mask) {
+#if !DEVICE && defined(__x86_64__) && !defined(BEND_U64_PORTABLE)
+#if defined(__BMI2__)
+  return _${op}_u64(x, mask);
+#else
+  if (__builtin_cpu_supports("bmi2")) return u64_${op}_bmi2(x, mask);
+#endif
+#endif
+  return u64_${op}_soft(x, mask);
+}
+`).join("\n")}
 
 INLINE f32 f32_unbox(u64 x) {
   union { u32 u; f32 f; } p = { (u32)x };
@@ -838,6 +922,12 @@ function live_dom([q]: Dom): boolean {
 
 function intr_of(c: Carb, k: Bend.Name, js = false): Intr | undefined {
   const tld = c.book.tlds[k];
+  // Recognize C-only U64 intrinsics during call analysis too, before ANF
+  // schedules a source implementation. JS keeps the exact Base definitions.
+  if (!c.js && !js && tld?.$ === "Def" && tld.b === true
+    && tld.i === undefined && u64_op(k) !== undefined) {
+    return U64_INTR;
+  }
   const it = tld?.$ === "Def" && tld.i === undefined && (tld.b || tld.v === null)
     ? OPERATIONS[eff_name(k)] : undefined;
   return it !== undefined && (js || it.C !== undefined || it.call === true)
@@ -1388,7 +1478,7 @@ function def_body(cb: Carb, k: Bend.Name): TLD | undefined {
 // each one's source summary (SRCS): what it refers to, what it calls (a
 // reference used as a value is no call; Clo.apply is never flat), and
 // whether it is flat: no fork, no bang call, self-calls in tail position.
-function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
+function carb_book(src: Bend.Book, roots: Bend.Name[], js = false): Carb {
   [TELES, SRCS, NODES, CYCLES, FLATS, SIGS, BRWS].forEach((m) => m.clear());
   LOCAL.clear();
   for (const [k, tld] of Object.entries(src.tlds)) {
@@ -1397,6 +1487,7 @@ function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
     }
   }
   const cb: Carb = {
+    js,
     book: { ...src, tlds: { ...src.tlds } },
     bangs: new Set(),
     sites: new Map(),
@@ -2153,8 +2244,72 @@ function emit_dst(fl: File, lay: Lay, k = "v"): Val {
   return val_new(emit_hold(fl, lay.ks.map(() => "0"), k, lay.ks), lay);
 }
 
+// Native expressions use packed scalar operands; the table is also the
+// call-analysis allowlist. Only trusted Base definitions take this path.
+const U64_C: Record<string, string> = Object.assign(Object.create(null), {
+  ...Object.fromEntries("add:+ sub:- mul:* and:& or:| xor:^".split(" ")
+    .map((s) => { const [n, op] = s.split(":"); return [n, `($0 ${op} $1)`]; })),
+  ...Object.fromEntries("is_eq:== is_ne:!= is_lt:< is_le:<= is_gt:> is_ge:>="
+    .split(" ").map((s) => {
+      const [n, op] = s.split(":"); return [n, `($0 ${op} $1)`];
+    })),
+  from_u32: "$0", from_parts: "((u64)$1 | ((u64)$0 << 32))",
+  low: "((u32)$0)", high: "((u32)($0 >> 32))",
+  inc: "($0 + 1ull)", not: "(~$0)", and_not: "($0 & ~$1)",
+  shl: "($0 << 1)", shr: "($0 >> 1)",
+  shln: "($1 >= 64 ? 0ull : ($0 << $1))",
+  shrn: "($1 >= 64 ? 0ull : ($0 >> $1))",
+  cmp: "(($0 > $1) + ($0 >= $1))",
+  is_zero: "($0 == 0)", is_odd: "(($0 & 1) != 0)",
+  bit: "($0 >= 64 ? 0ull : (1ull << $0))",
+  test_bit: "($1 < 64 && (($0 >> $1) & 1) != 0)",
+  set_bit: "($0 | ($1 >= 64 ? 0ull : (1ull << $1)))",
+  clear_bit: "($0 & ~($1 >= 64 ? 0ull : (1ull << $1)))",
+  toggle_bit: "($0 ^ ($1 >= 64 ? 0ull : (1ull << $1)))",
+  lsb: "($0 & (0ull - $0))", clear_lsb: "($0 & ($0 - 1ull))",
+  popcount: "u64_popcount($0)", popcnt: "u64_popcount($0)",
+  ctz: "u64_ctz($0)", clz: "u64_clz($0)",
+  pext: "u64_pext($0, $1)", pdep: "u64_pdep($0, $1)",
+});
+
+const U64_INTR: Intr = { u64: true, C: "",
+  JS: () => die("a C-only U64 intrinsic in a JS expression") };
+
+function u64_op(k: Bend.Name): string | undefined {
+  return k.startsWith("U64.") ? U64_C[k.slice(4)] : undefined;
+}
+
+// Pack only at this scalar boundary. Records, arrays, closures and returns
+// retain two w32 fields: unrestricted bits must never masquerade as Term tags.
+function emit_u64_c(fl: File, x: HTerm, ty: HTerm | null): Val {
+  const m = term_spine(fl, x);
+  const k = (m.t as Of<"Ref">).k;
+  const def = m.tld;
+  if (def?.$ !== "Def" || def.b !== true || def.i !== undefined || m.all.length !== def.n) {
+    die("an unsaturated or non-Base U64 intrinsic");
+  }
+  const sig = sig_def(fl, k);
+  const args = emit_each(fl, m.args).map((v, i) => {
+    const a = val_to(fl, v, sig.lays[i]);
+    const wide = ty_adt(fl.book, sig.live[i][2])?.k === "U64";
+    if (a.ws.length !== (wide ? 2 : 1)) die("a U64 intrinsic layout mismatch");
+    const e = wide ? `((u64)(u32)(${a.ws[0]}) | ((u64)(u32)(${a.ws[1]}) << 32))`
+      : val_word(a);
+    return emit_alias(fl, e, "u", "w64");
+  });
+  const T = ty ?? tele_unbind(fl.book, def.T).ret;
+  const e = tpl(u64_op(k) ?? die("an unknown U64 intrinsic"), args);
+  const wide = ty_adt(fl.book, T)?.k === "U64";
+  const u = wide ? emit_alias(fl, e, "u", "w64") : e;
+  return val_new(wide ? [`((u32)${u})`, `((u32)(${u} >> 32))`] : [u],
+    lay_of(fl.book, T));
+}
+
 function emit_intr(fl: File, it: Intr, x: HTerm,
   ty: HTerm | null): Val {
+  if (it.u64) {
+    return emit_u64_c(fl, x, ty);
+  }
   const m = term_spine(fl, x);
   const k = (m.t as Of<"Ref">).k;
   const args = emit_each(fl, m.args);
@@ -3106,7 +3261,7 @@ function js_def(fl: File, k: Bend.Name, def: Def): void {
 
 export function js_lib(book: Bend.Book, roots: Bend.Name[],
   outs: Bend.Name[] | null): string {
-  const cb = carb_book(book, roots.slice());
+  const cb = carb_book(book, roots.slice(), true);
   const fl = file_new(cb, "const");
   fl.tab = 0;
   const ms = done_defs(cb).map(([k]) => js_sat(k));
