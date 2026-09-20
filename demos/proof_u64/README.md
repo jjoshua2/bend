@@ -100,3 +100,21 @@ legal move generation, perft and make/unmake correctness, and end-to-end
 compiler verification. In particular, this module does not claim that PEXT
 constructs a correct chess attack table merely because its round trip is
 proved. GPU and ARM execution remain outside the completed validation.
+
+## Repository checks
+
+`bun tests/run/u64_repo.js` runs the unchanged file budgets plus failure
+controls for the token counter. Long compiler explanations now live in
+`guide/COMPILER.md`; no executable compiler code was moved or changed by
+that documentation cleanup. The compiler is below its existing 64,000-token cap.
+
+The permanent workflow also runs strict TypeScript checking separately.
+The pinned upstream checker (`6018e28ecc67cf1fffc0c20c64b11023474c2df8`)
+currently produces TS2339 at `bend2/bend.ts` lines 2084 and 3751. The
+human-maintained checker is kept byte-for-byte upstream: these failures
+remain visible rather than suppressed. Passing source proofs, native tests
+or the repository-size gate does not mean that strict TypeScript passes.
+
+The proof gate additionally rejects upstream #902's cyclic template instance,
+which otherwise could inhabit `Empty` and prove a false equality. Native
+regressions include all nine new or updated upstream fixtures from this sync.

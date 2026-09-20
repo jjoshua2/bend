@@ -3,6 +3,13 @@
 Each release names what changed for a user. `bend update` installs the
 latest one; the GitHub release carries the same notes.
 
+## 2.0.21 (2026-09-20)
+
+- A template instance that calls back into an instance whose body is
+  still being checked is refused as a self-call that does not decrease:
+  `loop(~k, u) = bounce(~loop(~k), u)` with `bounce(~f, u) = f(u)` once
+  checked, and inhabited `Empty` (#902).
+
 ## 2.0.20 (2026-09-20)
 
 - A `U32` match whose arm is a hand-written bit pattern answers that arm:

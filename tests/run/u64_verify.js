@@ -21,10 +21,12 @@ assert.ok(Number.isSafeInteger(cases) && cases >= 1 && cases <= 4096);
 const modes = [['generic', []], ['portable', ['-DBEND_U64_PORTABLE']],
   ['native', ['-march=native']],
   ['ubsan', ['-fsanitize=undefined', '-fno-sanitize-recover=all']]];
+// Match the upstream test gate: ignore trailing horizontal whitespace only.
+function tidy(text) { return text.replace(/[ \t]+$/gm, '').trim(); }
 function run(cmd, args, timeout = 120000) {
   const r = spawnSync(cmd, args, { encoding: 'utf8', timeout, maxBuffer: 32 << 20 });
   assert.equal(r.status, 0, `${cmd} ${args.join(' ')}\n${r.stdout}\n${r.stderr}`);
-  return r.stdout.trim();
+  return tidy(r.stdout);
 }
 function compile(src, stem) {
   run(bun, [...cli, src, '-o', stem + '.c', '-o', stem + '.js']);
@@ -36,8 +38,8 @@ const fixtures = ['tests/base/u64_ops.bend', 'tests/base/u64_bmi.bend',
   'tests/base/u64_scans.bend', 'tests/compile/u64_storage.bend',
   'tests/compile/u64_layout.bend', 'tests/base/u64_from_u32_variable.bend'];
 for (const [i, src] of fixtures.entries()) {
-  const want = fs.readFileSync(src, 'utf8').split('\n').filter(s => s.startsWith('#|'))
-    .map(s => s.slice(2)).join('\n').trim();
+  const want = tidy(fs.readFileSync(src, 'utf8').split('\n').filter(s => s.startsWith('#|'))
+    .map(s => s.slice(2)).join('\n'));
   assert.equal(run(bun, [...cli, src]), want, src + ' normalizer');
   const stem = path.join(dir, 't' + i);
   compile(src, stem);
@@ -58,14 +60,19 @@ if (process.argv.includes('--regressions')) {
   files.push('tests/compile/record_deep_boxed.bend',
     'tests/compile/fold_fuel_loop.bend', 'tests/run/fork_shared_flat.bend',
     'tests/run/family_field_hot.bend', 'tests/run/fork_held_family.bend',
-    'tests/import/shadow_base.bend', 'tests/proof/template_law.bend');
+    'tests/import/shadow_base.bend', 'tests/proof/template_law.bend',
+    'tests/check/template_inst_cycle.bend', 'tests/check/typed_let_mismatch.bend',
+    'tests/parse/typed_let_sugar.bend', 'tests/run/unsafe_mutual.bend',
+    'tests/cost/array_fill_readback.bend', 'tests/run/array_bounds_000.bend',
+    'tests/run/array_bounds_001.bend', 'tests/run/array_slab.bend',
+    'tests/run/array_struct_swap.bend');
   for (const [i, src] of files.entries()) {
     const text = fs.readFileSync(src, 'utf8');
-    const want = text.split('\n').filter(s => s.startsWith('#|')).map(s => s.slice(2)).join('\n').trim();
+    const want = tidy(text.split('\n').filter(s => s.startsWith('#|')).map(s => s.slice(2)).join('\n'));
     if (want.startsWith('Error:')) {
       const r = spawnSync(bun, [...cli, src], { encoding: 'utf8', timeout: 30000 });
       assert.equal(r.status, 1, src + ' expected rejection');
-      assert.equal((r.stdout + r.stderr).trim() + '\nexit 1', want);
+      assert.equal(tidy(r.stdout + r.stderr) + '\nexit 1', want);
       continue;
     }
     assert.equal(run(bun, [...cli, src]), want, src + ' regression normalizer');
