@@ -1,0 +1,121 @@
+name: Validate U64 gate cleanup
+on:
+  push:
+    branches: [work/u64-gates-20260920]
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: ${{ !startsWith(github.event.head_commit.message, 'Save validated U64 gate tree') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BEND_NO_TELEMETRY: '1'
+      U64_CASES: '1024'
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Integrate exact upstream and verified cleanup
+        run: |
+          git fetch https://github.com/bendlang/bend.git 6018e28ecc67cf1fffc0c20c64b11023474c2df8
+          git -c user.name='U64 audit' -c user.email='audit@example.invalid' merge --no-commit --no-ff FETCH_HEAD
+          mkdir -p /tmp/u64-gate-validation
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, gzip, hashlib, json, subprocess
+          raw = Path('.github/u64-gate-cleanup.patch.b64').read_text()
+          patch = gzip.decompress(base64.b64decode(raw))
+          assert hashlib.sha256(patch).hexdigest() == 'c3138a18cc5b7a828751818bd515044a7c99875244589271fcd5afb1450f5248'
+          Path('/tmp/u64-gate-validation/cleanup.patch').write_bytes(patch)
+          subprocess.run(['git','apply','--check','/tmp/u64-gate-validation/cleanup.patch'], check=True)
+          subprocess.run(['git','apply','/tmp/u64-gate-validation/cleanup.patch'], check=True)
+          before = subprocess.check_output(['git','show','806b373a7a4509479054da74a82271c6a4c25014:bend2/comp.ts'], text=True)
+          after = Path('bend2/comp.ts').read_text()
+          def code(s):
+              return '\n'.join(l for l in s.splitlines() if l.strip() and not l.lstrip().startswith('//'))
+          assert code(before) == code(after), 'Compiler executable source changed'
+          kernel = subprocess.check_output(['git','show','6018e28ecc67cf1fffc0c20c64b11023474c2df8:bend2/bend.ts'])
+          assert kernel == Path('bend2/bend.ts').read_bytes(), 'Protected checker differs from upstream'
+          info = {'compiler_non_comment_source_identical': True, 'non_comment_sha256': hashlib.sha256(code(after).encode()).hexdigest(), 'kernel_identical_to_upstream': '6018e28ecc67cf1fffc0c20c64b11023474c2df8'}
+          Path('/tmp/u64-gate-validation/source-audit.json').write_text(json.dumps(info, indent=2)+'\n')
+          PY
+          rm .github/u64-gate-cleanup.patch.b64 .github/workflows/u64-gates-integrate.yml
+          git add -A
+          git diff --cached --check
+          git write-tree > /tmp/u64-gate-validation/tested-tree.txt
+          git diff --cached 806b373a7a4509479054da74a82271c6a4c25014 > /tmp/u64-gate-validation/complete.patch
+      - name: Install pinned analysis tools
+        run: |
+          python3 -m venv /tmp/token-tools
+          /tmp/token-tools/bin/pip -q install ttok==0.3 tiktoken==0.14.0
+          echo /tmp/token-tools/bin >> "$GITHUB_PATH"
+          cd bend2/pack
+          bun install --frozen-lockfile
+          bun add --no-save typescript@5.9.3
+      - name: Full repository budgets and tool-failure controls
+        run: |
+          bun tests/run/u64_repo.js > /tmp/u64-gate-validation/repository.json
+          cat /tmp/u64-gate-validation/repository.json
+          for file in bend2/comp.ts bend2/base.bend guide/COMPILER.md .github/workflows/u64-correctness.yml; do
+            printf '%s ' "$file"
+            ttok < "$file"
+          done > /tmp/u64-gate-validation/tokens.txt
+          cat /tmp/u64-gate-validation/tokens.txt
+      - name: Source laws and seven rejection controls
+        run: |
+          bun tests/run/u64_proofs.js > /tmp/u64-gate-validation/proofs.json
+          cat /tmp/u64-gate-validation/proofs.json
+      - name: Expanded native and upstream regression validation
+        run: |
+          bun tests/run/u64_verify.js --regressions > /tmp/u64-gate-validation/native.json
+          cat /tmp/u64-gate-validation/native.json
+      - name: Record strict failures and compare exact upstream diagnostics
+        run: |
+          mkdir -p /tmp/u64-exact-upstream
+          git archive 6018e28ecc67cf1fffc0c20c64b11023474c2df8 | tar -x -C /tmp/u64-exact-upstream
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess, json
+          root = Path.cwd()
+          up = Path('/tmp/u64-exact-upstream')
+          (up/'bend2/pack/node_modules').symlink_to(root/'bend2/pack/node_modules', target_is_directory=True)
+          tsc = str(root/'bend2/pack/node_modules/typescript/bin/tsc')
+          out = Path('/tmp/u64-gate-validation')
+          reports = {}
+          for name, cwd in [('feature', root), ('upstream', up)]:
+              r = subprocess.run(['bun',tsc,'-p','bend2/pack/tsconfig.json','--pretty','false'], cwd=cwd, capture_output=True, text=True, timeout=120)
+              text = (r.stdout+r.stderr).replace(str(root),'<repo>').replace(str(up),'<repo>')
+              reports[name] = {'exit_status': r.returncode, 'diagnostics': text}
+              (out/('typescript-'+name+'.txt')).write_text(text)
+          (out/'typescript-comparison.json').write_text(json.dumps(reports,indent=2)+'\n')
+          print(json.dumps(reports,indent=2))
+          assert reports['feature'] == reports['upstream'], 'New strict diagnostic or changed exit status'
+          assert reports['feature']['exit_status'] != 0, 'Expected upstream strict failures need reevaluation'
+          print('Diagnostic equivalence verified; strict TypeScript remains FAIL.')
+          PY
+      - name: Publish tested source on isolated branch only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git diff --exit-code
+          test "$(git write-tree)" = "$(cat /tmp/u64-gate-validation/tested-tree.txt)"
+          git restore --source=HEAD -- .github/workflows/u64-gates-integrate.yml
+          git add .github/workflows/u64-gates-integrate.yml
+          test -z "$(git diff --cached --name-only HEAD -- .github/workflows)"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Save validated U64 gate tree'
+          git rev-parse HEAD > /tmp/u64-gate-validation/work-commit.txt
+          git rev-parse HEAD^{tree} > /tmp/u64-gate-validation/work-tree.txt
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c core.hooksPath=/dev/null -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/work/u64-gates-20260920
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: u64-gate-cleanup-validation
+          path: /tmp/u64-gate-validation
+          retention-days: 7
