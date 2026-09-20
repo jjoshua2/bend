@@ -16,7 +16,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
-      - name: Integrate pinned upstream, preserve safety checks, apply audited fixes
+      - name: Integrate upstream and PR 3 while preserving the reviewed U64 design
         id: merge
         run: |
           mkdir -p /tmp/u64-audit
@@ -24,6 +24,7 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch --no-tags https://github.com/bendlang/bend.git 7561656155a4285c1e4ccfcb3505ab59524de973
           git branch audit-upstream FETCH_HEAD
+          git fetch --no-tags origin d9b9bce9ce4c02583ca1a548cfd239b368c3fc77
           git merge --no-commit --no-ff audit-upstream > /tmp/u64-audit/merge.txt 2>&1 || true
           cat /tmp/u64-audit/merge.txt
           python3 - <<'PY'
@@ -51,8 +52,17 @@ jobs:
           test -z "$(git diff --name-only --diff-filter=U)"
           git apply --check /tmp/u64-audit/audit-fixes.patch
           git apply /tmp/u64-audit/audit-fixes.patch
+          git show d9b9bce9ce4c02583ca1a548cfd239b368c3fc77:tests/base/u64_from_u32_variable.bend > tests/base/u64_from_u32_variable.bend
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('tests/run/u64_verify.js')
+          s = p.read_text()
+          old = "'tests/compile/u64_layout.bend'];"
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, "'tests/compile/u64_layout.bend', 'tests/base/u64_from_u32_variable.bend'];"))
+          PY
           git rm .github/workflows/u64-sync-audit.yml .github/u64-sync-fixes.patch.gz.b64
-          git add bend2/comp.ts guide/GUIDE.md tests/run/u64_verify.js tests/compile/u64_layout.bend
+          git add bend2/comp.ts guide/GUIDE.md tests/run/u64_verify.js tests/compile/u64_layout.bend tests/base/u64_from_u32_variable.bend
           git diff --cached --check audit-upstream
           git diff --cached --exit-code audit-upstream -- bend2/bend.ts gates/repo.ts
           git diff --exit-code
@@ -70,15 +80,31 @@ jobs:
         run: |
           set -o pipefail
           bun tests/run/u64_verify.js --regressions --bench | tee /tmp/u64-audit/validation.json
-      - name: Strict compiler-core TypeScript check
+      - name: Compare strict TypeScript diagnostics with exact upstream
         id: types
         if: always() && steps.merge.outcome == 'success'
         working-directory: bend2/pack
         run: |
           bun install --frozen-lockfile
+          cp ../comp.ts /tmp/u64-tested-comp.ts
+          trap 'cp /tmp/u64-tested-comp.ts ../comp.ts; rm -f tsconfig.u64-review.json' EXIT
           printf '%s\n' '{"extends":"./tsconfig.json","include":["../bend.ts","../comp.ts"]}' > tsconfig.u64-review.json
-          bunx tsc -p tsconfig.u64-review.json
-          rm tsconfig.u64-review.json
+          fork_status=0
+          bunx tsc --pretty false -p tsconfig.u64-review.json > /tmp/u64-audit/typescript-fork.txt 2>&1 || fork_status=$?
+          git show audit-upstream:bend2/comp.ts > ../comp.ts
+          upstream_status=0
+          bunx tsc --pretty false -p tsconfig.u64-review.json > /tmp/u64-audit/typescript-upstream.txt 2>&1 || upstream_status=$?
+          cp /tmp/u64-tested-comp.ts ../comp.ts
+          cat /tmp/u64-audit/typescript-fork.txt
+          diff -u /tmp/u64-audit/typescript-upstream.txt /tmp/u64-audit/typescript-fork.txt
+          test "$fork_status" = "$upstream_status"
+          printf '%s\n' "$fork_status" > /tmp/u64-audit/typescript-status.txt
+          printf 'Fork and upstream have identical TypeScript diagnostics (exit %s).\n' "$fork_status"
+      - name: Strict TypeScript gate remains visible
+        if: always() && steps.types.outcome == 'success'
+        run: |
+          cat /tmp/u64-audit/typescript-fork.txt
+          exit "$(cat /tmp/u64-audit/typescript-status.txt)"
       - name: Measure and enforce unmodified source budgets
         id: size
         if: always() && steps.merge.outcome == 'success'
@@ -92,7 +118,7 @@ jobs:
             ttok < "$f"
           done | tee /tmp/u64-audit/sizes.txt
           bun gates/repo.ts | tee /tmp/u64-audit/size-policy.txt
-      - name: Publish validated merge without rewriting U64 review history
+      - name: Publish tested integration to the draft review, preserving PR 3 ancestry
         if: always() && steps.merge.outcome == 'success' && steps.runtime.outcome == 'success' && steps.types.outcome == 'success'
         run: |
           git diff --exit-code
@@ -102,7 +128,7 @@ jobs:
           test "$(git ls-remote origin refs/heads/feat/u64-compact-reviewed | cut -f1)" = '57bc84edc0df32780e2c4dde44e3a2ee1a500cc9'
           test ! -f .github/workflows/u64-sync-audit.yml
           test ! -f .github/u64-sync-fixes.patch.gz.b64
-          commit="$(git commit-tree "$(cat /tmp/u64-audit/tested-tree.txt)" -p 57bc84edc0df32780e2c4dde44e3a2ee1a500cc9 -p 7561656155a4285c1e4ccfcb3505ab59524de973 -m 'Merge Bend 2.0.20 upstream and fix U64 widening with expanded regression coverage')"
+          commit="$(git commit-tree "$(cat /tmp/u64-audit/tested-tree.txt)" -p d9b9bce9ce4c02583ca1a548cfd239b368c3fc77 -p 7561656155a4285c1e4ccfcb3505ab59524de973 -m 'Merge Bend 2.0.20 and U64 widening fix with expanded regression coverage')"
           git push origin "$commit":refs/heads/feat/u64-compact-reviewed
           printf '%s\n' "$commit" | tee /tmp/u64-audit/published-commit.txt
       - uses: actions/upload-artifact@v4
