@@ -1,0 +1,44 @@
+name: U64 upstream audit
+on:
+  push:
+    branches: [work/u64-sync-20260920]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - name: Merge pinned upstream without publishing changes
+        id: merge
+        run: |
+          mkdir -p /tmp/u64-audit
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags https://github.com/bendlang/bend.git 7561656155a4285c1e4ccfcb3505ab59524de973
+          git branch audit-upstream FETCH_HEAD
+          git merge --no-commit --no-ff audit-upstream > /tmp/u64-audit/merge.txt 2>&1 || true
+          cat /tmp/u64-audit/merge.txt
+          git diff --name-only --diff-filter=U | tee /tmp/u64-audit/conflicts.txt
+          git diff --stat audit-upstream > /tmp/u64-audit/stat.txt
+          git log --oneline b4929c2d0d9d1e9598954aa37758954bab4d8a77..audit-upstream > /tmp/u64-audit/upstream-commits.txt
+          git diff b4929c2d0d9d1e9598954aa37758954bab4d8a77 audit-upstream -- bend2/base.bend bend2/comp.ts > /tmp/u64-audit/upstream-core.diff
+          tar -czf /tmp/u64-audit/source.tar.gz bend2 tests gates guide README.md AGENTS.md CHANGELOG.md
+          git diff --binary b4929c2d0d9d1e9598954aa37758954bab4d8a77 57bc84edc0df32780e2c4dde44e3a2ee1a500cc9 > /tmp/u64-audit/original-u64.patch
+          if test -s /tmp/u64-audit/conflicts.txt; then echo 'clean=false' >> "$GITHUB_OUTPUT"; else echo 'clean=true' >> "$GITHUB_OUTPUT"; fi
+      - name: Existing U64 semantic and regression tests
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          set -o pipefail
+          bun tests/run/u64_verify.js --regressions | tee /tmp/u64-audit/validation.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: u64-upstream-audit
+          path: /tmp/u64-audit/
+          retention-days: 14
