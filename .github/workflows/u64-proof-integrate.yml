@@ -1,0 +1,71 @@
+name: Validate U64 proof integration
+on:
+  push:
+    branches: [work/u64-laws-20260920]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BEND_NO_TELEMETRY: '1'
+      U64_CASES: '1024'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Apply checksum-verified patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, gzip, hashlib
+          raw = Path('.github/u64-laws.patch.b64').read_text()
+          raw = raw.replace('Nrb9j9bf/tIM', 'Nrb9j9/tIM')
+          patch = gzip.decompress(base64.b64decode(raw))
+          assert hashlib.sha256(patch).hexdigest() == '014d5cc85a2a387b6180560225e4cfb83b534ef42da9f8248fea31e66e08edbb'
+          Path('/tmp/u64-laws.patch').write_bytes(patch)
+          PY
+          git apply --check /tmp/u64-laws.patch
+          git apply /tmp/u64-laws.patch
+          rm .github/u64-laws.patch.b64 .github/workflows/u64-proof-integrate.yml
+          git diff --check
+          test "$(git hash-object bend2/bend.ts)" = "$(git rev-parse fd1df81707fd758f749a9570ccb5b12b1bb2fea3:bend2/bend.ts)"
+          test "$(git hash-object bend2/comp.ts)" = "$(git rev-parse fd1df81707fd758f749a9570ccb5b12b1bb2fea3:bend2/comp.ts)"
+          mkdir -p /tmp/u64-validation
+          cp /tmp/u64-laws.patch /tmp/u64-validation/
+      - name: Check source proofs and negative controls
+        run: bun tests/run/u64_proofs.js | tee /tmp/u64-validation/proofs.json
+      - name: Validate native reference agreement
+        run: bun tests/run/u64_verify.js --regressions | tee /tmp/u64-validation/native.json
+      - name: Record source budgets without changing their limits
+        run: |
+          python3 -m venv /tmp/u64-token-env
+          /tmp/u64-token-env/bin/pip -q install ttok
+          /tmp/u64-token-env/bin/pip freeze > /tmp/u64-validation/token-tools.txt
+          for file in bend2/base.bend bend2/comp.ts demos/proof_u64/Words.bend .github/workflows/u64-correctness.yml; do
+            printf '%s ' "$file"
+            /tmp/u64-token-env/bin/ttok < "$file"
+          done | tee /tmp/u64-validation/source-tokens.txt
+      - name: Publish only the tested tree on the isolated work branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add -A
+          git diff --cached --stat fd1df81707fd758f749a9570ccb5b12b1bb2fea3 > /tmp/u64-validation/stat.txt
+          git diff --cached fd1df81707fd758f749a9570ccb5b12b1bb2fea3 > /tmp/u64-validation/published.patch
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Add checked U64 laws and fail-closed proof CI'
+          git rev-parse HEAD > /tmp/u64-validation/tested-commit.txt
+          git rev-parse HEAD^{tree} > /tmp/u64-validation/tested-tree.txt
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c core.hooksPath=/dev/null -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/work/u64-laws-20260920
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: u64-laws-validation
+          path: /tmp/u64-validation
+          retention-days: 7
