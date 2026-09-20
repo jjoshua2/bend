@@ -160,7 +160,9 @@ the GPU. The heap is fully unified, so, if your chip
 has unified memory (as in Apple M-series processors), moving data from the CPU
 to the GPU is a zero-cost operation. The GPU shines on uniform numeric work like
 mandelbrot or nbody; divergent work like n-queens stays faster on the CPU. A
-machine without a GPU runs `!` on the CPU (still in parallel).
+machine without a GPU runs `!` on the CPU (still in parallel). What the lanes
+share also sets the speed: a `+` value read by every lane costs an atomic per
+read. Read `bend guide shaders` before you write a parallel app.
 
 The JavaScript target ignores all that and just runs sequentially.
 
@@ -315,6 +317,7 @@ the AI does not touch it. `PROOF.bend` imports `LAWS.bend` and proves each law
 with a def of the same name (`law sorted` is proven by `def Laws.sorted`): the
 AI writes it, along with the code. `bend PROOF.bend` is the gate: it fails while
 any law is open or false, and prints "All terms check." once every law holds.
+bend refuses a `PROOF.bend` that sits beside a `LAWS.bend` without importing it.
 
 Bend has no tactics: a proposition is a type, and a proof is a def of that type.
 `{a == b : T}` is an equality; `{==}` proves it when both sides compute to the
@@ -374,7 +377,9 @@ underscores. You can add your own effects the same way. Only the event loop runs
 them, so proofs, termination and the GPU never touch host code. In the other
 direction, a JS file may `import Game from "./game.bend"` (with `bend2/main.ts`
 preloaded) and call every non-IO def, with constructors as `{$: "Name", field:
-value}` and `Nat` as `BigInt`.
+value}` and `Nat` as `BigInt`. A value crosses without a copy: an `Array`
+argument is the caller's own array, updated in place, so copy it first if you
+keep it.
 
 ### Monads
 
@@ -515,6 +520,14 @@ against an independent BigInt oracle, forces portable paths, runs UBSan,
 and checks the x86 instruction output where available. Its opt-in dynamic
 checks include every single-bit board from square 0 through 63 and oversized
 shift counts; these are not added to the default normalizer golden tests.
+The default oracle now checks 41 results for each of 256 runtime-fed random
+pairs, 64 single-bit boards and 14 boundary pairs (13,694 results per lane).
+It includes every native operation, U32-to-U64 widening after comparisons,
+carry/borrow, counts through 2^48-1, partial applications, and boxed/shared
+records. Every C variant runs with one and four threads. Set `U64_CASES`
+from 1 through 4096 for a different randomized sample count. Rows are
+printed separately so increasing coverage does not overflow JS List.show's
+recursive traversal.
 
 ### Modules
 
@@ -555,7 +568,8 @@ bend file.bend -o file.c  # emit the C source instead
 bend file.bend -o file.js # emit the JS source instead
 bend page.html -o dist    # bundle a web page that imports .bend files
 ./file --threads 8        # run a native binary on 8 CPU threads
-./file --gpu 4GB          # enables the GPU, with max 4GB memory
+./file --gpu off          # run ! calls on the CPU (the GPU is on by default)
+./file --gpu 4GB          # cap the GPU's heap at 4GB
 ```
 
 A `main` that returns `IO` runs compiled; one that returns a value is normalized
@@ -664,3 +678,14 @@ recursion must terminate. `bend2/bend.lean` mechanizes this, though it lags
 - `demos/`: complete programs, including the game and its proof from the video.
 - `bend2/base.bend`: the Base library, also printed by `bend base`.
 - `paper/BendTT.pdf` and `paper/BendRT.pdf`: the type theory and the runtime.
+
+## Extra
+
+`bend guide shaders` prints "Shaders in Bend", a tutorial written by AIs for
+AIs on how to write efficient shaders in Bend. It distills what building
+`demos/app_slash_boss_3d` (120 FPS in pure Bend) taught. Read it before you
+write a graphical or parallel app in Bend.
+
+`bend guide effects` prints "Effects in Bend", an AI-written note (to be
+revised by a human) on the C and JS side of custom effects. Read it before
+you write one.

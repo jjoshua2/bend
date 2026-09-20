@@ -1,6 +1,7 @@
 // Standalone, opt-in local/CI validation. No cluster, npm dependencies or GPU.
 // Usage: bun tests/run/u64_verify.js [--regressions] [--bench]
 // BENCH_N changes the opt-in benchmark length; CC selects Clang.
+// U64_CASES selects 1..4096 runtime-fed random pairs (default 256).
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -15,6 +16,11 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bend-u64-'));
 const mask64 = (1n << 64n) - 1n;
 const cli = [path.join(root, 'bend2/main.ts')];
 const report = [];
+const cases = Number(process.env.U64_CASES || 256);
+assert.ok(Number.isSafeInteger(cases) && cases >= 1 && cases <= 4096);
+const modes = [['generic', []], ['portable', ['-DBEND_U64_PORTABLE']],
+  ['native', ['-march=native']],
+  ['ubsan', ['-fsanitize=undefined', '-fno-sanitize-recover=all']]];
 function run(cmd, args, timeout = 120000) {
   const r = spawnSync(cmd, args, { encoding: 'utf8', timeout, maxBuffer: 32 << 20 });
   assert.equal(r.status, 0, `${cmd} ${args.join(' ')}\n${r.stdout}\n${r.stderr}`);
@@ -24,10 +30,11 @@ function compile(src, stem) {
   run(bun, [...cli, src, '-o', stem + '.c', '-o', stem + '.js']);
 }
 function build(stem, name, flags = []) {
-  run(cc, ['-O3', '-std=c11', ...flags, stem + '.c', '-pthread', '-lm', '-o', name]);
+  run(cc, ['-O3', '-std=c11', '-Werror=shift-count-overflow', ...flags, stem + '.c', '-pthread', '-lm', '-o', name]);
 }
 const fixtures = ['tests/base/u64_ops.bend', 'tests/base/u64_bmi.bend',
-  'tests/base/u64_scans.bend', 'tests/compile/u64_storage.bend'];
+  'tests/base/u64_scans.bend', 'tests/compile/u64_storage.bend',
+  'tests/compile/u64_layout.bend', 'tests/base/u64_from_u32_variable.bend'];
 for (const [i, src] of fixtures.entries()) {
   const want = fs.readFileSync(src, 'utf8').split('\n').filter(s => s.startsWith('#|'))
     .map(s => s.slice(2)).join('\n').trim();
@@ -35,8 +42,7 @@ for (const [i, src] of fixtures.entries()) {
   const stem = path.join(dir, 't' + i);
   compile(src, stem);
   assert.equal(run(bun, [stem + '.js']), want, src + ' JS');
-  for (const [tag, flags] of [['generic', []], ['portable', ['-DBEND_U64_PORTABLE']],
-    ['native', ['-march=native']], ['ubsan', ['-fsanitize=undefined', '-fno-sanitize-recover=all']]]) {
+  for (const [tag, flags] of modes) {
     const out = stem + '-' + tag;
     build(stem, out, flags);
     assert.equal(run(out, []), want, src + ' ' + tag);
@@ -48,6 +54,11 @@ if (process.argv.includes('--regressions')) {
   const files = ['base', 'compile'].flatMap(ns => fs.readdirSync('tests/' + ns)
     .filter(f => /^(u32|array|closure)[a-z0-9_]*\.bend$/.test(f))
     .map(f => 'tests/' + ns + '/' + f));
+  // Recent upstream regressions at the same representation/template boundaries.
+  files.push('tests/compile/record_deep_boxed.bend',
+    'tests/compile/fold_fuel_loop.bend', 'tests/run/fork_shared_flat.bend',
+    'tests/run/family_field_hot.bend', 'tests/run/fork_held_family.bend',
+    'tests/import/shadow_base.bend', 'tests/proof/template_law.bend');
   for (const [i, src] of files.entries()) {
     const text = fs.readFileSync(src, 'utf8');
     const want = text.split('\n').filter(s => s.startsWith('#|')).map(s => s.slice(2)).join('\n').trim();
@@ -92,7 +103,9 @@ function scans(x) {
     x === 0n ? 64n : BigInt(bits.length - bits.lastIndexOf('1') - 1),
     x === 0n ? 64n : BigInt(64 - bits.length)];
 }
+fs.copyFileSync('tests/compile/u64_layout.bend', path.join(dir, 'u64_layout.bend'));
 const common = `import Base
+import ./u64_layout.bend as Layout
 
 def seed() -> IO(U32):
   import "./seed.c"
@@ -120,41 +133,82 @@ const exprs = ['U64.pext(x, m)', 'U64.pdep(x, m)', 'U64.mul(x, m)',
   'U64.shln(x, n)', 'U64.shrn(x, n)', 'U64.set_bit(x, n)',
   'U64.clear_bit(x, n)', 'U64.toggle_bit(x, n)',
   'U64.from_u32(U64.popcnt(x))', 'U64.from_u32(U64.ctz(x))',
-  'U64.from_u32(U64.clz(x))'];
+  'U64.from_u32(U64.clz(x))',
+  ...['add', 'sub', 'and', 'or', 'xor'].map(op => `U64.${op}(x, m)`),
+  ...['inc', 'not', 'shl', 'shr'].map(op => `U64.${op}(x)`),
+  ...['is_eq', 'is_ne', 'is_lt', 'is_le', 'is_gt', 'is_ge']
+    .map(op => `U64.from_u32(Bool.to_u32(U64.${op}(x, m)))`),
+  ...['is_zero', 'is_odd'].map(op => `U64.from_u32(Bool.to_u32(U64.${op}(x)))`),
+  'U64.from_u32(Bool.to_u32(U64.test_bit(x, n)))', 'U64.bit(n)',
+  'cmp_code(U64.cmp(x, m))', 'U64.from_u32(U64.popcount(x))',
+  'U64.from_u32(U64.low(x))', 'U64.from_u32(U64.high(x))',
+  'U64.from_parts(U64.high(x), U64.low(x))',
+  'Layout.boxed(x)', 'Layout.shared(x)', 'Layout.apply(U64.mul(x), m)'];
+const edges = [
+  [0n, 0n, 0n], [0n, mask64, 1n], [mask64, 0n, 64n],
+  [mask64, 1n, 32n], [1n, mask64, 33n], [mask64, mask64, 63n],
+  [0xffffffffn, 1n, 31n], [0x100000000n, 1n, 32n],
+  [1n, 0x100000000n, 33n], [0x8000000000000000n, 1n, 63n],
+  [0x7fffffffffffffffn, 0x8000000000000000n, 64n],
+  [0x8300000003000000n, 0x55555555aaaaaaaan, 65n],
+  [0x8000000000000000n, 0x8000000000000000n, 4294967295n],
+  [mask64, mask64, 281474976710655n],
+];
+const nat = n => n <= 0xffffffffn ? `${n}n`
+  : `Nat.add(Nat.mul(${n >> 32n}n, Nat.add(4294967295n, 1n)), ${n & 0xffffffffn}n)`;
+const edgeCalls = edges.map(([a, m, n]) =>
+  `print_observe(U64.xor(${u(a)}, salt), ${u(m)}, ${nat(n)})`);
+const edgePrints = edgeCalls.map((call, i) =>
+  '    ' + (i + 1 === edgeCalls.length ? '' : 'Unit <- ') + call).join('\n');
 const src = path.join(dir, 'dynamic.bend');
 fs.writeFileSync(src, common + `
+def cmp_code(c: Cmp) -> U64:
+  match c:
+    case LT{}:
+      U64.zero()
+    case EQ{}:
+      U64.one()
+    case GT{}:
+      U64.from_u32(2)
+
 def observe(+x: U64, +m: U64, +n: Nat) -> List<U64>:
   [${exprs.join(',\n    ')}]
 
-def samples(n: Nat, x: U64) -> List<U64>:
+# One small row per print: a giant List.show would test the JS stack
+# limit rather than the integer operations as the sample count increases.
+def print_observe(x: U64, m: U64, n: Nat) -> IO(Unit):
+  IO.print(List.show(~&1, ~U64, ~show, observe(x, m, n)))
+
+def samples(n: Nat, x: U64) -> IO(Unit):
   match n:
     case 0n:
-      []
+      IO.pure(Unit, Unit{})
     case 1n+p:
       +a = next(x)
       +m = next(a)
-      List.append(&1, U64, observe(a, m, U32.to_nat(U32.and(U64.low(m), 127))), samples(p, m))
+      do IO<Unit>:
+        Unit <- print_observe(a, m, U32.to_nat(U32.and(U64.low(m), 127)))
+        samples(p, m)
 
 # Exhaust every source/destination single bit without putting an expensive
 # normalizer walk into the default golden tests.
-def basis(+n: Nat) -> List<U64>:
+def basis(+n: Nat) -> IO(Unit):
   match n:
     case 0n:
-      []
+      IO.pure(Unit, Unit{})
     case 1n+p:
       +x = U64.bit(p)
-      List.append(&1, U64, observe(x, x, p), basis(p))
+      do IO<Unit>:
+        Unit <- print_observe(x, x, p)
+        basis(p)
 
 def main() -> IO(Unit):
   do IO<Unit>:
-    s : U32 <- seed()
-    random : List<U64> = samples(64n, U64.from_parts(2882400018, s))
-    edges : List<U64> = List.append(&1, U64,
-      observe(U64.bit(63n), U64.bit(63n), U32.to_nat(4294967295)),
-      observe(U64.not(U64.zero()), U64.zero(), 64n))
-    all : List<U64> = List.append(&1, U64, random,
-      List.append(&1, U64, basis(64n), edges))
-    IO.print(List.show(~&1, ~U64, ~show, all))
+    +s : U32 <- seed()
+    +salt : U64 = U64.from_u32(U32.xor(s, 123456789))
+    Unit <- samples(${cases}n, U64.from_parts(2882400018, s))
+    Unit <- basis(64n)
+${edgePrints}
 `);
 let x = (2882400018n << 32n) | 123456789n;
 const expected = [];
@@ -162,28 +216,44 @@ function oracle(a, m, n) {
   const bit = n >= 64n ? 0n : 1n << n;
   expected.push(pext(a,m), pdep(a,m), (a*m)&mask64, a & (~m & mask64),
     a & -a, a & (a-1n), n >= 64n ? 0n : (a<<n)&mask64,
-    n >= 64n ? 0n : a>>n, a|bit, a & (~bit & mask64), a^bit, ...scans(a));
+    n >= 64n ? 0n : a>>n, a|bit, a & (~bit & mask64), a^bit, ...scans(a),
+    (a+m)&mask64, (a-m)&mask64, a&m, a|m, a^m,
+    (a+1n)&mask64, (~a)&mask64, (a<<1n)&mask64, a>>1n,
+    ...[a===m, a!==m, a<m, a<=m, a>m, a>=m, a===0n, (a&1n)!==0n,
+      (a&bit)!==0n].map(v => BigInt(v)), bit,
+    a<m ? 0n : a===m ? 1n : 2n, scans(a)[0],
+    a&0xffffffffn, a>>32n, a, a, a, (a*m)&mask64);
 }
-for (let i = 0; i < 64; i++) {
+for (let i = 0; i < cases; i++) {
   x = next(x); const a = x; x = next(x);
   oracle(a, x, x & 127n);
 }
 for (let i = 63n; i >= 0n; i--) oracle(1n << i, 1n << i, i);
-oracle(1n << 63n, 1n << 63n, 4294967295n);
-oracle(mask64, 0n, 64n);
-const want = '[' + expected.map(show).join(', ') + ']';
+for (const [a, m, n] of edges) oracle(a, m, n);
+assert.equal(expected.length, (cases + 64 + edges.length) * exprs.length);
+const rows = [];
+for (let i = 0; i < expected.length; i += exprs.length) {
+  rows.push('[' + expected.slice(i, i + exprs.length).map(show).join(', ') + ']');
+}
 const stem = path.join(dir, 'dynamic');
 compile(src, stem);
 // Recognizing intrinsics only at emission is too late: ANF used to leave
 // recursive U64 shifts in the hot path. Pin analysis/codegen, not only counts.
 assert.ok(!/^#define FID_U64_(?:(?:SHLN|SHRN|PEXT|PDEP)_GO|PERMUTE)/m.test(
   fs.readFileSync(stem + '.c', 'utf8')), 'U64 intrinsic leaked a source loop');
-assert.equal(run(bun, [stem + '.js']), want, 'dynamic JS vs independent BigInt');
-for (const [tag, flags] of [['generic', []], ['portable', ['-DBEND_U64_PORTABLE']],
-  ['native', ['-march=native']], ['ubsan', ['-fsanitize=undefined', '-fno-sanitize-recover=all']]]) {
+function checkRows(got, lane) {
+  const actual = got.split('\n');
+  assert.equal(actual.length, rows.length, lane + ' row count');
+  rows.forEach((row, i) => assert.equal(actual[i], row, lane + ' sample ' + i));
+}
+checkRows(run(bun, [stem + '.js']), 'dynamic JS vs independent BigInt');
+for (const [tag, flags] of modes) {
   const out = stem + '-' + tag;
   build(stem, out, flags);
-  assert.equal(run(out, []), want, 'dynamic ' + tag + ' vs independent BigInt');
+  for (const threads of ['1', '4']) {
+    checkRows(run(out, ['--threads', threads]),
+      'dynamic ' + tag + ' threads=' + threads + ' vs independent BigInt');
+  }
   if (process.arch === 'x64' && tag !== 'ubsan') {
     const asm = run('objdump', ['-d', out]);
     const hasPext = /\tpext\s/.test(asm), hasPdep = /\tpdep\s/.test(asm);
@@ -192,7 +262,9 @@ for (const [tag, flags] of [['generic', []], ['portable', ['-DBEND_U64_PORTABLE'
     report.push({ dynamic: tag, values: expected.length, pext_instruction: hasPext, pdep_instruction: hasPdep });
   }
 }
-report.push({ dynamic: 'JS + four C variants', independent_oracle_values: expected.length });
+report.push({ dynamic: 'JS + four C variants at 1 and 4 threads',
+  random_pairs: cases, single_bits: 64, edge_pairs: edges.length,
+  expressions_per_pair: exprs.length, independent_oracle_values: expected.length });
 
 if (process.argv.includes('--bench')) {
   const n = Number(process.env.BENCH_N || 2000000);

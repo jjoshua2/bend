@@ -6,7 +6,7 @@ function chan_send(handle, value, k) {
   if (row.shut) {
     return false;
   }
-  if (row.wait.length > 0 && row.wait[0].item === null) {
+  if (row.wait.length > 0 && row.wait[0].item === CHAN_RECV) {
     chan_wake(row, { $: "Some", value: value });
     return true;
   }

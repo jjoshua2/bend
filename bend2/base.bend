@@ -207,6 +207,10 @@ def IO.pass(-A: Type, r: Result<&1, &1, U32 & String, A>) -> IO(A):
 def IO.try(-A: Type, act: IO(Result<&1, &1, U32 & String, A>)) -> IO(A):
   IO.bind(Result<&1, &1, U32 & String, A>, A, act, IO.pass(A))
 
+def IO.random_u32() -> IO(Result<&1, &1, U32 & String, U32>):
+  import "./effs/random_u32.c"
+  import "./effs/random_u32.js"
+
 def IO.spawn(-A: Type, act: IO(A)) -> IO(Unit):
   import "./effs/spawn.c"
   import "./effs/spawn.js"
@@ -268,10 +272,25 @@ def File.read_bytes(file: File, max: U32) ->
   import "./effs/file_read_bytes.c"
   import "./effs/file_read_bytes.js"
 
+def File.read_at(file: File, offset: U32, max: U32) ->
+  IO(File & Result<&1, &1, U32 & String, List<&2, U32>>):
+  import "./effs/file_read_at.c"
+  import "./effs/file_read_at.js"
+
+def File.size(file: File) ->
+  IO(File & Result<&1, &1, U32 & String, U32>):
+  import "./effs/file_size.c"
+  import "./effs/file_size.js"
+
 def File.write(file: File, data: String) ->
   IO(File & Result<&1, &1, U32 & String, Unit>):
   import "./effs/file_write.c"
   import "./effs/file_write.js"
+
+def File.write_bytes(file: File, data: List<&2, U32>) ->
+  IO(File & Result<&1, &1, U32 & String, Unit>):
+  import "./effs/file_write_bytes.c"
+  import "./effs/file_write_bytes.js"
 
 def File.close(file: File) -> IO(Unit):
   import "./effs/file_close.c"
@@ -300,6 +319,11 @@ def TCP.recv(sock: Socket, max: U32) ->
   IO(Socket & Result<&1, &1, U32 & String, String>):
   import "./effs/tcp_recv.c"
   import "./effs/tcp_recv.js"
+
+def TCP.poll(sock: Socket, max: U32, ms: U32) ->
+  IO(Socket & Result<&1, &1, U32 & String, Maybe<&1, String>>):
+  import "./effs/tcp_poll.c"
+  import "./effs/tcp_poll.js"
 
 def UDP.bind(port: U32) -> IO(Result<&1, &1, U32 & String, Socket>):
   import "./effs/udp_bind.c"
@@ -610,10 +634,63 @@ def Nat.is_ge(a: Nat, b: Nat) -> Bool:
   Cmp.is_ge(Nat.cmp(a, b))
 
 def Nat.min(+a: Nat, +b: Nat) -> Nat:
-  Bool.pick(Nat, Nat.is_lt(a, b), a, b)
+  match a b:
+    case 0n _:
+      0n
+    case 1n+ap 0n:
+      0n
+    case 1n+ap 1n+bp:
+      1n+Nat.min(ap, bp)
 
 def Nat.max(+a: Nat, +b: Nat) -> Nat:
-  Bool.pick(Nat, Nat.is_lt(a, b), b, a)
+  match a b:
+    case 0n _:
+      b
+    case 1n+ap 0n:
+      1n+ap
+    case 1n+ap 1n+bp:
+      1n+Nat.max(ap, bp)
+
+law Nat.ge_refl:
+  for a: Nat
+  {Nat.is_ge(a, a) == True{} : Bool}
+
+def Nat.ge_refl(a):
+  match a:
+    case 0n:
+      {==}
+    case 1n+p:
+      Nat.ge_refl(p)
+
+law Nat.max_ge_l:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_ge(Nat.max(a, b), a) == True{} : Bool}
+
+def Nat.max_ge_l(a, b):
+  match a b:
+    case 0n 0n:
+      {==}
+    case 0n 1n+bp:
+      {==}
+    case 1n+ap 0n:
+      Nat.ge_refl(a)
+    case 1n+ap 1n+bp:
+      Nat.max_ge_l(ap, bp)
+
+law Nat.max_ge_r:
+  for +a: Nat
+  for +b: Nat
+  {Nat.is_ge(Nat.max(a, b), b) == True{} : Bool}
+
+def Nat.max_ge_r(a, b):
+  match a b:
+    case 0n _:
+      Nat.ge_refl(b)
+    case 1n+ap 0n:
+      {==}
+    case 1n+ap 1n+bp:
+      Nat.max_ge_r(ap, bp)
 
 def Nat.div.fin(qr: Nat & Nat) -> Nat:
   (q, r) = qr

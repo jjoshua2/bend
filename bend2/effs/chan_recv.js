@@ -6,12 +6,12 @@ function chan_recv(handle, k) {
   if (row.ring.length > 0) {
     return { $: "Some", value: chan_take(row) };
   }
-  if (row.wait.length > 0 && row.wait[0].item !== null) {
+  if (row.wait.length > 0 && row.wait[0].item !== CHAN_RECV) {
     return { $: "Some", value: chan_wake(row, true) };
   }
   if (row.shut) {
     return { $: "None" };
   }
-  row.wait.push({ cont: k, item: null });
+  row.wait.push({ cont: k, item: CHAN_RECV });
   return;
 }
