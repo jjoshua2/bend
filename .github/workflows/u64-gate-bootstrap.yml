@@ -1,0 +1,49 @@
+name: Prepare isolated U64 gate audit
+on:
+  push:
+    branches: [work/u64-gates-20260920]
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BEND_NO_TELEMETRY: '1'
+      TIKTOKEN_CACHE_DIR: /tmp/u64-audit/cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Integrate pinned upstream without publishing
+        run: |
+          git fetch https://github.com/bendlang/bend.git 6018e28ecc67cf1fffc0c20c64b11023474c2df8
+          git -c user.name='U64 audit' -c user.email='audit@example.invalid' merge --no-commit --no-ff FETCH_HEAD
+          mkdir -p /tmp/u64-audit
+          git diff --cached 806b373a7a4509479054da74a82271c6a4c25014 > /tmp/u64-audit/upstream.patch
+          git log --oneline 7561656155a4285c1e4ccfcb3505ab59524de973..FETCH_HEAD > /tmp/u64-audit/upstream.txt
+          git rev-parse FETCH_HEAD > /tmp/u64-audit/upstream-sha.txt
+      - name: Prepare token and type-check tooling
+        run: |
+          python3 -m venv /tmp/u64-token-env
+          /tmp/u64-token-env/bin/pip -q install ttok==0.3 tiktoken==0.14.0
+          /tmp/u64-token-env/bin/ttok < bend2/comp.ts > /tmp/u64-audit/compiler-tokens.txt
+          /tmp/u64-token-env/bin/pip download --only-binary=:all: --no-deps --platform manylinux_2_28_x86_64 --python-version 313 --implementation cp --abi cp313 --dest /tmp/u64-audit/wheels tiktoken==0.14.0 ttok==0.3
+          cd bend2/pack
+          bun install --frozen-lockfile
+          bun add --no-save typescript@5.9.3
+      - name: Package exact checkout and dependencies
+        run: |
+          tar -czf /tmp/u64-audit/source.tar.gz --exclude=.git --exclude=paper --exclude=media --exclude=bench --exclude=bend2/docs .
+          cp "$(command -v bun)" /tmp/u64-audit/bun
+          git diff --check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: u64-gate-audit-environment
+          path: /tmp/u64-audit
+          retention-days: 1
