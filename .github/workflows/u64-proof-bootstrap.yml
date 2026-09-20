@@ -1,0 +1,29 @@
+name: U64 proof bootstrap
+on:
+  push:
+    branches: [work/u64-laws-20260920]
+permissions:
+  contents: read
+jobs:
+  toolchain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Package exact checker for local proof development
+        run: |
+          mkdir -p /tmp/u64-checker
+          cp "$(command -v bun)" /tmp/u64-checker/bun
+          tar -czf /tmp/u64-checker/source.tar.gz bend2 demos/proof_numerics tests/proof tests/base tests/compile tests/run
+          bun --version
+          sha256sum /tmp/u64-checker/bun /tmp/u64-checker/source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u64-proof-checker
+          path: /tmp/u64-checker
+          retention-days: 1
