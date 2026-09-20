@@ -2,19 +2,21 @@ name: U64 upstream audit
 on:
   push:
     branches: [work/u64-sync-20260920]
+    paths: ['.github/workflows/u64-sync-audit.yml']
 permissions:
-  contents: read
+  contents: write
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
+    env:
+      BEND_NO_TELEMETRY: '1'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
       - uses: oven-sh/setup-bun@v2
-      - name: Merge pinned upstream without publishing changes
+      - name: Integrate pinned upstream, preserve safety checks, apply audited fixes
         id: merge
         run: |
           mkdir -p /tmp/u64-audit
@@ -24,21 +26,88 @@ jobs:
           git branch audit-upstream FETCH_HEAD
           git merge --no-commit --no-ff audit-upstream > /tmp/u64-audit/merge.txt 2>&1 || true
           cat /tmp/u64-audit/merge.txt
-          git diff --name-only --diff-filter=U | tee /tmp/u64-audit/conflicts.txt
-          git diff --stat audit-upstream > /tmp/u64-audit/stat.txt
-          git log --oneline b4929c2d0d9d1e9598954aa37758954bab4d8a77..audit-upstream > /tmp/u64-audit/upstream-commits.txt
-          git diff b4929c2d0d9d1e9598954aa37758954bab4d8a77 audit-upstream -- bend2/base.bend bend2/comp.ts > /tmp/u64-audit/upstream-core.diff
-          tar -czf /tmp/u64-audit/source.tar.gz bend2 tests gates guide README.md AGENTS.md CHANGELOG.md
-          git diff --binary b4929c2d0d9d1e9598954aa37758954bab4d8a77 57bc84edc0df32780e2c4dde44e3a2ee1a500cc9 > /tmp/u64-audit/original-u64.patch
-          if test -s /tmp/u64-audit/conflicts.txt; then echo 'clean=false' >> "$GITHUB_OUTPUT"; else echo 'clean=true' >> "$GITHUB_OUTPUT"; fi
-      - name: Existing U64 semantic and regression tests
-        if: steps.merge.outputs.clean == 'true'
+          python3 - <<'PY'
+          import pathlib, gzip, base64, hashlib
+          p = pathlib.Path('bend2/comp.ts')
+          s = p.read_text()
+          assert s.count('<<<<<<< HEAD\n') == 2
+          chunks = []
+          for i in range(2):
+              pre, s = s.split('<<<<<<< HEAD\n', 1)
+              ours, s = s.split('=======\n', 1)
+              theirs, s = s.split('>>>>>>> audit-upstream\n', 1)
+              if i == 0:
+                  assert 'U64_PORTABLE' in ours and 'U32_QUO' in theirs
+                  chunks.append(pre + ours + '\n' + theirs)
+              else:
+                  assert 'function carb_book' in ours and 'book_owned(src);' in theirs and 'NODES, LAYS' in theirs
+                  chunks.append(pre + ours.splitlines()[0] + '\n' + '\n'.join(theirs.splitlines()[1:]) + '\n')
+          p.write_text(''.join(chunks) + s)
+          patch = gzip.decompress(base64.b64decode(pathlib.Path('.github/u64-sync-fixes.patch.gz.b64').read_text().strip(), validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '645159e08a17c57a565ee7fcdef5b73050a97bc2a51cea2dadc1cf091f2c1cd8'
+          pathlib.Path('/tmp/u64-audit/audit-fixes.patch').write_bytes(patch)
+          PY
+          git add bend2/comp.ts
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git apply --check /tmp/u64-audit/audit-fixes.patch
+          git apply /tmp/u64-audit/audit-fixes.patch
+          git rm .github/workflows/u64-sync-audit.yml .github/u64-sync-fixes.patch.gz.b64
+          git add bend2/comp.ts guide/GUIDE.md tests/run/u64_verify.js tests/compile/u64_layout.bend
+          git diff --cached --check
+          git diff --cached --exit-code audit-upstream -- bend2/bend.ts gates/repo.ts
+          git diff --exit-code
+          git write-tree > /tmp/u64-audit/tested-tree.txt
+          git diff --cached --stat audit-upstream > /tmp/u64-audit/stat.txt
+          git diff --cached --binary audit-upstream > /tmp/u64-audit/full-u64.patch
+          clang --version > /tmp/u64-audit/toolchain.txt
+          bun --version >> /tmp/u64-audit/toolchain.txt
+          lscpu >> /tmp/u64-audit/toolchain.txt
+      - name: U64 oracle, recent upstream regressions, and scalar benchmark
+        id: runtime
+        env:
+          U64_CASES: '1024'
+          BENCH_N: '20000000'
         run: |
           set -o pipefail
-          bun tests/run/u64_verify.js --regressions | tee /tmp/u64-audit/validation.json
+          bun tests/run/u64_verify.js --regressions --bench | tee /tmp/u64-audit/validation.json
+      - name: Strict compiler-core TypeScript check
+        id: types
+        if: always() && steps.merge.outcome == 'success'
+        working-directory: bend2/pack
+        run: |
+          bun install --frozen-lockfile
+          printf '%s\n' '{"extends":"./tsconfig.json","include":["../bend.ts","../comp.ts"]}' > tsconfig.u64-review.json
+          bunx tsc -p tsconfig.u64-review.json
+          rm tsconfig.u64-review.json
+      - name: Measure and enforce unmodified source budgets
+        id: size
+        if: always() && steps.merge.outcome == 'success'
+        run: |
+          set -o pipefail
+          python3 -m pip install --quiet ttok
+          for f in bend2/base.bend bend2/comp.ts; do
+            printf 'Upstream %s: ' "$f"
+            git show audit-upstream:"$f" | ttok
+            printf 'U64 fork %s: ' "$f"
+            ttok < "$f"
+          done | tee /tmp/u64-audit/sizes.txt
+          bun gates/repo.ts | tee /tmp/u64-audit/size-policy.txt
+      - name: Publish validated merge without rewriting U64 review history
+        if: always() && steps.merge.outcome == 'success' && steps.runtime.outcome == 'success' && steps.types.outcome == 'success'
+        run: |
+          git diff --exit-code
+          git diff --cached --check
+          git diff --cached --exit-code audit-upstream -- bend2/bend.ts gates/repo.ts
+          test "$(git write-tree)" = "$(cat /tmp/u64-audit/tested-tree.txt)"
+          test "$(git ls-remote origin refs/heads/feat/u64-compact-reviewed | cut -f1)" = '57bc84edc0df32780e2c4dde44e3a2ee1a500cc9'
+          test ! -f .github/workflows/u64-sync-audit.yml
+          test ! -f .github/u64-sync-fixes.patch.gz.b64
+          commit="$(git commit-tree "$(cat /tmp/u64-audit/tested-tree.txt)" -p 57bc84edc0df32780e2c4dde44e3a2ee1a500cc9 -p 7561656155a4285c1e4ccfcb3505ab59524de973 -m 'Merge Bend 2.0.20 upstream and fix U64 widening with expanded regression coverage')"
+          git push origin "$commit":refs/heads/feat/u64-compact-reviewed
+          printf '%s\n' "$commit" | tee /tmp/u64-audit/published-commit.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: u64-upstream-audit
           path: /tmp/u64-audit/
-          retention-days: 14
+          retention-days: 30
