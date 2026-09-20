@@ -1536,8 +1536,90 @@ def Word.popcount(n: Nat, w: Word(n), acc: U32) -> U32:
         case WCon{b, t}:
           Word.popcount(p, t, U32.add(acc, Bool.to_u32(b)))
 
+def Word.count(n: Nat, w: Word(n)) -> Nat:
+  match n:
+    case 0n:
+      0n
+    case 1n+p:
+      match w:
+        case WCon{False{}, t}:
+          Word.count(p, t)
+        case WCon{True{}, t}:
+          1n+Word.count(p, t)
+
+# Proof-friendly reference operations on least-significant-bit-first words.
+# Native U64 C intrinsics still bypass these structural definitions.
+def Word.take(n: Nat, -m: Nat, w: Word(Nat.add(n, m))) -> Word(n):
+  match n:
+    case 0n:
+      WNil{}
+    case 1n+p:
+      match w:
+        case WCon{b, t}:
+          WCon{b, Word.take(p, m, t)}
+
+def Word.drop(n: Nat, -m: Nat, w: Word(Nat.add(n, m))) -> Word(m):
+  match n:
+    case 0n:
+      w
+    case 1n+p:
+      match w:
+        case WCon{b, t}:
+          Word.drop(p, m, t)
+
+def Word.join(n: Nat, -m: Nat, a: Word(n), b: Word(m)) -> Word(Nat.add(n, m)):
+  match n:
+    case 0n:
+      b
+    case 1n+p:
+      match a:
+        case WCon{h, t}:
+          WCon{h, Word.join(p, m, t, b)}
+
+def Word.trim(n: Nat, w: Word(1n+n)) -> Word(n):
+  match n:
+    case 0n:
+      WNil{}
+    case 1n+p:
+      match w:
+        case WCon{b, t}:
+          WCon{b, Word.trim(p, t)}
+
+def Word.pext(n: Nat, a: Word(n), mask: Word(n)) -> Word(n):
+  match n:
+    case 0n:
+      WNil{}
+    case 1n++p:
+      match a mask:
+        case WCon{b, t} WCon{False{}, m}:
+          Word.shr.pad(p, Word.pext(p, t, m))
+        case WCon{b, t} WCon{True{}, m}:
+          WCon{b, Word.pext(p, t, m)}
+
+# Mask first lets the empty destination bit ignore the source head.
+def Word.pdep(n: Nat, mask: Word(n), a: Word(n)) -> Word(n):
+  match n:
+    case 0n:
+      WNil{}
+    case 1n++p:
+      match mask:
+        case WCon{False{}, m}:
+          WCon{False{}, Word.pdep(p, m, Word.trim(p, a))}
+        case WCon{True{}, m}:
+          match a:
+            case WCon{b, t}:
+              WCon{b, Word.pdep(p, m, t)}
+
 # U64
 # ---
+
+def U64.to_word(a: U64) -> Word(64n):
+  match a:
+    case U64{U32{lo}, U32{hi}}:
+      Word.join(32n, 32n, lo, hi)
+
+def U64.from_word(+w: Word(64n)) -> U64:
+  U64{U32{Word.take(32n, 32n, w)}, U32{Word.drop(32n, 32n, w)}}
 
 def U64.zero() -> U64:
   U64{0, 0}
@@ -1679,10 +1761,10 @@ def U64.test_bit(a: U64, n: Nat) -> Bool:
 def U64.lsb(+a: U64) -> U64:
   U64.and(a, U64.sub(U64.zero(), a))
 
+# The reference counts in Nat (at most 64), then converts to U32.
+# C still lowers this public operation to its guarded POPCNT helper.
 def U64.popcount(a: U64) -> U32:
-  match a:
-    case U64{U32{lo}, U32{hi}}:
-      U32.add(Word.popcount(32n, lo, 0), Word.popcount(32n, hi, 0))
+  U32.from_nat(Word.count(64n, U64.to_word(a)))
 
 # For zero this wraps to all ones, so the zero result is also 64.
 def U64.ctz(a: U64) -> U32:
@@ -1737,9 +1819,8 @@ def U64.clz.go(n: Nat, +a: U64, acc: U32) -> U32:
 def U64.clz(a: U64) -> U32:
   U64.clz.go(64n, a, 0)
 
-# A shared terminating bit walk: PEXT gathers mask bits into low bits;
-# PDEP reverses the source/destination bit roles. The template flag is
-# compile-time, so neither compiled lane switches mode inside the loop.
+# Legacy shared bit walk, retained for compatibility. Public PEXT/PDEP
+# below use structural Word definitions so their laws admit induction.
 def U64.permute(~deposit: Bool, n: Nat, +a: U64, +mask: U64, +bit: U64, acc: U64) -> U64:
   match n:
     case 0n:
@@ -1752,10 +1833,10 @@ def U64.permute(~deposit: Bool, n: Nat, +a: U64, +mask: U64, +bit: U64, acc: U64
       U64.permute(~deposit, p, a, U64.clear_lsb(mask), U64.shl(bit), U64.or(acc, add))
 
 def U64.pext(a: U64, mask: U64) -> U64:
-  U64.permute(~False{}, 64n, a, mask, U64.one(), U64.zero())
+  U64.from_word(Word.pext(64n, U64.to_word(a), U64.to_word(mask)))
 
 def U64.pdep(a: U64, mask: U64) -> U64:
-  U64.permute(~True{}, 64n, a, mask, U64.one(), U64.zero())
+  U64.from_word(Word.pdep(64n, U64.to_word(mask), U64.to_word(a)))
 
 # F32
 # ---

@@ -1,0 +1,41 @@
+name: U64 correctness
+on:
+  push:
+    branches: [main, feat/u64-compact-reviewed, work/u64-laws-20260920]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: u64-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  proofs:
+    name: U64 source proofs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BEND_NO_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun tests/run/u64_proofs.js
+  native:
+    name: U64 native/reference agreement
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BEND_NO_TELEMETRY: '1'
+      U64_CASES: '1024'
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun tests/run/u64_verify.js --regressions

@@ -29,6 +29,7 @@ function allow(at: string | RegExp, cap: number, bytes = false): void {
 }
 
 allow(/^\.github\/ISSUE_TEMPLATE\/(bug|feature|config)\.yml$/, 600);
+allow(".github/workflows/u64-correctness.yml", 1200);
 allow(".gitattributes", 200);
 allow(".gitignore", 100);
 allow("AGENTS.md", 2000);
