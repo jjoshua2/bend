@@ -53,7 +53,7 @@ jobs:
           git apply /tmp/u64-audit/audit-fixes.patch
           git rm .github/workflows/u64-sync-audit.yml .github/u64-sync-fixes.patch.gz.b64
           git add bend2/comp.ts guide/GUIDE.md tests/run/u64_verify.js tests/compile/u64_layout.bend
-          git diff --cached --check
+          git diff --cached --check audit-upstream
           git diff --cached --exit-code audit-upstream -- bend2/bend.ts gates/repo.ts
           git diff --exit-code
           git write-tree > /tmp/u64-audit/tested-tree.txt
@@ -96,7 +96,7 @@ jobs:
         if: always() && steps.merge.outcome == 'success' && steps.runtime.outcome == 'success' && steps.types.outcome == 'success'
         run: |
           git diff --exit-code
-          git diff --cached --check
+          git diff --cached --check audit-upstream
           git diff --cached --exit-code audit-upstream -- bend2/bend.ts gates/repo.ts
           test "$(git write-tree)" = "$(cat /tmp/u64-audit/tested-tree.txt)"
           test "$(git ls-remote origin refs/heads/feat/u64-compact-reviewed | cut -f1)" = '57bc84edc0df32780e2c4dde44e3a2ee1a500cc9'
