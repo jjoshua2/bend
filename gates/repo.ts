@@ -29,6 +29,7 @@ function allow(at: string | RegExp, cap: number, bytes = false): void {
 }
 
 allow(/^\.github\/ISSUE_TEMPLATE\/(bug|feature|config)\.yml$/, 600);
+allow(".github/workflows/u64-correctness.yml", 1200);
 allow(".gitattributes", 200);
 allow(".gitignore", 100);
 allow("AGENTS.md", 2000);
@@ -59,6 +60,7 @@ allow(/^demos\/[a-z0-9_]+\/[A-Za-z0-9_]+\.bend$/, 64000);
 allow(/^demos\/[a-z0-9_]+\/[A-Za-z_]+\.(c|sh|md)$/, 4000);
 allow(/^demos\/[a-z0-9_]+\/web\/(index\.html|main\.js|bunfig\.toml)$/, 4000);
 allow("guide/GUIDE.md", 12000);
+allow("guide/COMPILER.md", 4000);
 allow("guide/EFFECTS.md", 1600);
 allow("guide/SHADERS.md", 4200);
 allow(/^paper\/(BendRT|BendTT)\.pdf$/, 400000, true);
@@ -79,8 +81,16 @@ allow(/^tools\/bend-fmt-lsp\/src\/test\/[a-z_]+\.test\.ts$/, 4000);
 // ====
 
 function ttok(file: string): number {
-  const got = child.spawnSync("ttok", [], { input: fs.readFileSync(file) });
-  return Number(got.stdout.toString().trim());
+  const got = child.spawnSync("ttok", [], { input: fs.readFileSync(file),
+    encoding: "utf8", timeout: 30000 });
+  const text = got.stdout?.trim() ?? "";
+  const n = Number(text);
+  if (got.error || got.status !== 0 || !/^[0-9]+$/.test(text)
+    || !Number.isSafeInteger(n) || n <= 0) {
+    throw new Error("ttok failed for " + file + ": "
+      + (got.error?.message || got.stderr?.trim() || text || "exit " + got.status));
+  }
+  return n;
 }
 
 function gate(): string[] {

@@ -54,6 +54,9 @@ type Word.Con<-p: Nat> is Data:
 type U32 is Data:
   U32{data: Word(32n)}
 
+type U64 is Data:
+  U64{lo: U32, hi: U32}
+
 type F32 is Data:
   F32{data: Word(32n)}
 
@@ -1523,6 +1526,317 @@ def U32.pow(+a: U32, n: Nat) -> U32:
 
 def U32.is_even(a: U32) -> Bool:
   U32.is_zero(U32.and(a, 1))
+
+def Word.popcount(n: Nat, w: Word(n), acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      match w:
+        case WCon{b, t}:
+          Word.popcount(p, t, U32.add(acc, Bool.to_u32(b)))
+
+def Word.count(n: Nat, w: Word(n)) -> Nat:
+  match n:
+    case 0n:
+      0n
+    case 1n+p:
+      match w:
+        case WCon{False{}, t}:
+          Word.count(p, t)
+        case WCon{True{}, t}:
+          1n+Word.count(p, t)
+
+# Proof-friendly reference operations on least-significant-bit-first words.
+# Native U64 C intrinsics still bypass these structural definitions.
+def Word.take(n: Nat, -m: Nat, w: Word(Nat.add(n, m))) -> Word(n):
+  match n:
+    case 0n:
+      WNil{}
+    case 1n+p:
+      match w:
+        case WCon{b, t}:
+          WCon{b, Word.take(p, m, t)}
+
+def Word.drop(n: Nat, -m: Nat, w: Word(Nat.add(n, m))) -> Word(m):
+  match n:
+    case 0n:
+      w
+    case 1n+p:
+      match w:
+        case WCon{b, t}:
+          Word.drop(p, m, t)
+
+def Word.join(n: Nat, -m: Nat, a: Word(n), b: Word(m)) -> Word(Nat.add(n, m)):
+  match n:
+    case 0n:
+      b
+    case 1n+p:
+      match a:
+        case WCon{h, t}:
+          WCon{h, Word.join(p, m, t, b)}
+
+def Word.trim(n: Nat, w: Word(1n+n)) -> Word(n):
+  match n:
+    case 0n:
+      WNil{}
+    case 1n+p:
+      match w:
+        case WCon{b, t}:
+          WCon{b, Word.trim(p, t)}
+
+def Word.pext(n: Nat, a: Word(n), mask: Word(n)) -> Word(n):
+  match n:
+    case 0n:
+      WNil{}
+    case 1n++p:
+      match a mask:
+        case WCon{b, t} WCon{False{}, m}:
+          Word.shr.pad(p, Word.pext(p, t, m))
+        case WCon{b, t} WCon{True{}, m}:
+          WCon{b, Word.pext(p, t, m)}
+
+# Mask first lets the empty destination bit ignore the source head.
+def Word.pdep(n: Nat, mask: Word(n), a: Word(n)) -> Word(n):
+  match n:
+    case 0n:
+      WNil{}
+    case 1n++p:
+      match mask:
+        case WCon{False{}, m}:
+          WCon{False{}, Word.pdep(p, m, Word.trim(p, a))}
+        case WCon{True{}, m}:
+          match a:
+            case WCon{b, t}:
+              WCon{b, Word.pdep(p, m, t)}
+
+# U64
+# ---
+
+def U64.to_word(a: U64) -> Word(64n):
+  match a:
+    case U64{U32{lo}, U32{hi}}:
+      Word.join(32n, 32n, lo, hi)
+
+def U64.from_word(+w: Word(64n)) -> U64:
+  U64{U32{Word.take(32n, 32n, w)}, U32{Word.drop(32n, 32n, w)}}
+
+def U64.zero() -> U64:
+  U64{0, 0}
+
+def U64.one() -> U64:
+  U64{1, 0}
+
+def U64.from_u32(lo: U32) -> U64:
+  U64{lo, 0}
+
+def U64.from_parts(hi: U32, lo: U32) -> U64:
+  U64{lo, hi}
+
+def U64.low(a: U64) -> U32:
+  match a:
+    case U64{lo, hi}:
+      lo
+
+def U64.high(a: U64) -> U32:
+  match a:
+    case U64{lo, hi}:
+      hi
+
+def U64.add(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{+alo, ahi} U64{blo, bhi}:
+      +lo = U32.add(alo, blo)
+      carry = Bool.to_u32(U32.is_lt(lo, alo))
+      U64{lo, U32.add(U32.add(ahi, bhi), carry)}
+
+def U64.inc(a: U64) -> U64:
+  U64.add(a, U64.one())
+
+def U64.sub(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{+alo, ahi} U64{+blo, bhi}:
+      borrow = Bool.to_u32(U32.is_lt(alo, blo))
+      U64{U32.sub(alo, blo), U32.sub(U32.sub(ahi, bhi), borrow)}
+
+def U64.not(a: U64) -> U64:
+  match a:
+    case U64{lo, hi}:
+      U64{U32.not(lo), U32.not(hi)}
+
+def U64.and(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{alo, ahi} U64{blo, bhi}:
+      U64{U32.and(alo, blo), U32.and(ahi, bhi)}
+
+def U64.or(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{alo, ahi} U64{blo, bhi}:
+      U64{U32.or(alo, blo), U32.or(ahi, bhi)}
+
+def U64.xor(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{alo, ahi} U64{blo, bhi}:
+      U64{U32.xor(alo, blo), U32.xor(ahi, bhi)}
+
+def U64.shl(a: U64) -> U64:
+  match a:
+    case U64{+lo, hi}:
+      U64{U32.shl(lo), U32.or(U32.shl(hi), U32.shrn(lo, 31n))}
+
+def U64.shr(a: U64) -> U64:
+  match a:
+    case U64{lo, +hi}:
+      U64{U32.or(U32.shr(lo), U32.shln(hi, 31n)), U32.shr(hi)}
+
+def U64.shln.go(n: Nat, a: U64) -> U64:
+  match n:
+    case 0n:
+      a
+    case 1n+p:
+      U64.shl(U64.shln.go(p, a))
+
+def U64.shrn.go(n: Nat, a: U64) -> U64:
+  match n:
+    case 0n:
+      a
+    case 1n+p:
+      U64.shr(U64.shrn.go(p, a))
+
+# Saturating shift counts: no lane iterates an unbounded user count.
+def U64.shln(a: U64, n: Nat) -> U64:
+  U64.shln.go(Nat.min(n, 64n), a)
+
+def U64.shrn(a: U64, n: Nat) -> U64:
+  U64.shrn.go(Nat.min(n, 64n), a)
+
+def U64.cmp.fin(alo: U32, blo: U32, hi: Cmp) -> Cmp:
+  match hi:
+    case LT{}:
+      LT{}
+    case EQ{}:
+      U32.cmp(alo, blo)
+    case GT{}:
+      GT{}
+
+def U64.cmp(a: U64, b: U64) -> Cmp:
+  match a b:
+    case U64{alo, ahi} U64{blo, bhi}:
+      U64.cmp.fin(alo, blo, U32.cmp(ahi, bhi))
+
+def U64.is_eq(a: U64, b: U64) -> Bool:
+  Cmp.is_eq(U64.cmp(a, b))
+
+def U64.is_ne(a: U64, b: U64) -> Bool:
+  Bool.not(U64.is_eq(a, b))
+
+def U64.is_lt(a: U64, b: U64) -> Bool:
+  Cmp.is_lt(U64.cmp(a, b))
+
+def U64.is_le(a: U64, b: U64) -> Bool:
+  Cmp.is_le(U64.cmp(a, b))
+
+def U64.is_gt(a: U64, b: U64) -> Bool:
+  Cmp.is_gt(U64.cmp(a, b))
+
+def U64.is_ge(a: U64, b: U64) -> Bool:
+  Cmp.is_ge(U64.cmp(a, b))
+
+def U64.is_zero(a: U64) -> Bool:
+  match a:
+    case U64{lo, hi}:
+      Bool.and(U32.is_zero(lo), U32.is_zero(hi))
+
+def U64.is_odd(a: U64) -> Bool:
+  match a:
+    case U64{lo, hi}:
+      Bool.not(U32.is_even(lo))
+
+def U64.bit(n: Nat) -> U64:
+  U64.shln(U64.one(), n)
+
+def U64.test_bit(a: U64, n: Nat) -> Bool:
+  U64.is_ne(U64.and(a, U64.bit(n)), U64.zero())
+
+def U64.lsb(+a: U64) -> U64:
+  U64.and(a, U64.sub(U64.zero(), a))
+
+# The reference counts in Nat (at most 64), then converts to U32.
+# C still lowers this public operation to its guarded POPCNT helper.
+def U64.popcount(a: U64) -> U32:
+  U32.from_nat(Word.count(64n, U64.to_word(a)))
+
+# For zero this wraps to all ones, so the zero result is also 64.
+def U64.ctz(a: U64) -> U32:
+  U64.popcount(U64.sub(U64.lsb(a), U64.one()))
+
+# High half of a 32x32 product, using bounded 16-bit partial products.
+# Each intermediate sum fits U32; the outer U64 product wraps modulo 2^64.
+def U64.mul.high32(+a: U32, +b: U32) -> U32:
+  +a0 = U32.and(a, 65535)
+  +a1 = U32.shrn(a, 16n)
+  +b0 = U32.and(b, 65535)
+  +b1 = U32.shrn(b, 16n)
+  w0 = U32.mul(a0, b0)
+  +t = U32.add(U32.mul(a1, b0), U32.shrn(w0, 16n))
+  w1 = U32.add(U32.mul(a0, b1), U32.and(t, 65535))
+  U32.add(U32.add(U32.mul(a1, b1), U32.shrn(t, 16n)), U32.shrn(w1, 16n))
+
+def U64.mul(a: U64, b: U64) -> U64:
+  match a b:
+    case U64{+alo, ahi} U64{+blo, bhi}:
+      hi = U32.add(U64.mul.high32(alo, blo),
+        U32.add(U32.mul(ahi, blo), U32.mul(alo, bhi)))
+      U64{U32.mul(alo, blo), hi}
+
+# a & ~b (the opposite operand order from x86's ANDN intrinsic).
+def U64.and_not(a: U64, b: U64) -> U64:
+  U64.and(a, U64.not(b))
+
+def U64.clear_lsb(+a: U64) -> U64:
+  U64.and(a, U64.sub(a, U64.one()))
+
+def U64.set_bit(a: U64, n: Nat) -> U64:
+  U64.or(a, U64.bit(n))
+
+def U64.clear_bit(a: U64, n: Nat) -> U64:
+  U64.and_not(a, U64.bit(n))
+
+def U64.toggle_bit(a: U64, n: Nat) -> U64:
+  U64.xor(a, U64.bit(n))
+
+def U64.popcnt(a: U64) -> U32:
+  U64.popcount(a)
+
+def U64.clz.go(n: Nat, +a: U64, acc: U32) -> U32:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      U64.clz.go(p, U64.shr(a), Bool.pick(U32, U64.is_odd(a), 0, U32.inc(acc)))
+
+# clz(0) = ctz(0) = 64; lsb(0) = clear_lsb(0) = 0.
+def U64.clz(a: U64) -> U32:
+  U64.clz.go(64n, a, 0)
+
+# Legacy shared bit walk, retained for compatibility. Public PEXT/PDEP
+# below use structural Word definitions so their laws admit induction.
+def U64.permute(~deposit: Bool, n: Nat, +a: U64, +mask: U64, +bit: U64, acc: U64) -> U64:
+  match n:
+    case 0n:
+      acc
+    case 1n+p:
+      +low = U64.lsb(mask)
+      src = Bool.pick(U64, deposit, bit, low)
+      dst = Bool.pick(U64, deposit, low, bit)
+      add = Bool.pick(U64, U64.is_zero(U64.and(a, src)), U64.zero(), dst)
+      U64.permute(~deposit, p, a, U64.clear_lsb(mask), U64.shl(bit), U64.or(acc, add))
+
+def U64.pext(a: U64, mask: U64) -> U64:
+  U64.from_word(Word.pext(64n, U64.to_word(a), U64.to_word(mask)))
+
+def U64.pdep(a: U64, mask: U64) -> U64:
+  U64.from_word(Word.pdep(64n, U64.to_word(mask), U64.to_word(a)))
 
 # F32
 # ---

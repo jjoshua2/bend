@@ -2,6 +2,8 @@
 // by AI's, as it includes a ton of optimizations. It works and tests pass, yet,
 // bugs ARE expected. It will take some time for the compiler to be stable.
 
+// Extended compiler/runtime design notes: ../guide/COMPILER.md.
+
 import * as fs from "node:fs";
 
 import * as Bend from "./bend.ts";
@@ -61,6 +63,7 @@ type Src = { refs: Set<Bend.Name>; deps: Set<Bend.Name>; flat: boolean };
 
 type Carb = {
   book: Book;
+  js: boolean;
   bangs: Set<Bend.Name>;
   sites: Map<Bend.Name, number>;
   hot: Set<Bend.Name>;
@@ -124,6 +127,7 @@ type Call = {
 };
 
 type Intr = {
+  u64?: boolean;
   C?: Gen | string[];
   call?: boolean;
   JS: Gen;
@@ -148,9 +152,7 @@ const NATIVE_DIE = " does not match the native format of its type";
 // The term nodes one segment may gain by folding calls at compile time.
 const FOLD_FUEL = 8192;
 
-// A native with this many lines or more is a call on both lanes: the
-// device inlines every native into every caller (hvm5 under a bang: 32 s
-// of Metal compile, 2.6 s so); at 128 raytrace lost 31% on PAR-CPU.
+// Outline natives at this line threshold; see the tuning notes.
 const SPIN_FAR = 256;
 
 const USE0 = Bend.Emp<number>();
@@ -425,6 +427,88 @@ ${SHIMS}
 #endif
 
 #define U32_BIN(a, o, b) ((u64)((u32)(a) o (u32)(b)))
+
+// BEND_U64_PORTABLE forces architecture-neutral helpers for testing/deployment.
+// Otherwise feature-targeted functions make generic x86-64 binaries safe,
+// while -mbmi2/-mpopcnt (or -march=native) removes hot-path dispatch entirely.
+#if !DEVICE && defined(__x86_64__) && !defined(BEND_U64_PORTABLE)
+#include <immintrin.h>
+#if !defined(__POPCNT__)
+__attribute__((target("popcnt"), noinline))
+static u64 u64_popcount_hw(u64 x) {
+  return (u64)__builtin_popcountll((unsigned long long)x);
+}
+#endif
+#endif
+
+INLINE u64 u64_popcount_soft(u64 x) {
+  x -= (x >> 1) & 0x5555555555555555ull;
+  x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
+  x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0full;
+  return (x * 0x0101010101010101ull) >> 56;
+}
+
+INLINE u64 u64_popcount(u64 x) {
+#if DEVICE || defined(BEND_U64_PORTABLE)
+  return u64_popcount_soft(x);
+#elif defined(__x86_64__) && !defined(__POPCNT__)
+  // Clang's CPU feature table is initialized once, not CPUID per call.
+  return __builtin_cpu_supports("popcnt") ? u64_popcount_hw(x)
+    : u64_popcount_soft(x);
+#else
+  return (u64)__builtin_popcountll((unsigned long long)x);
+#endif
+}
+
+INLINE u64 u64_ctz(u64 x) {
+  if (x == 0) return 64;
+#if DEVICE || defined(BEND_U64_PORTABLE)
+  // Isolate the low bit; it minus one has exactly ctz(x) set bits.
+  return u64_popcount_soft((x & (0ull - x)) - 1ull);
+#else
+  return (u64)__builtin_ctzll((unsigned long long)x);
+#endif
+}
+
+INLINE u64 u64_clz(u64 x) {
+  if (x == 0) return 64;
+#if DEVICE || defined(BEND_U64_PORTABLE)
+  x |= x >> 1; x |= x >> 2; x |= x >> 4;
+  x |= x >> 8; x |= x >> 16; x |= x >> 32;
+  return 64 - u64_popcount_soft(x);
+#else
+  return (u64)__builtin_clzll((unsigned long long)x);
+#endif
+}
+
+${["pext", "pdep"].map((op) => `
+#if !DEVICE && defined(__x86_64__) && !defined(BEND_U64_PORTABLE) && !defined(__BMI2__)
+__attribute__((target("bmi2"), noinline))
+static u64 u64_${op}_bmi2(u64 x, u64 m) { return _${op}_u64(x, m); }
+#endif
+
+INLINE u64 u64_${op}_soft(u64 x, u64 mask) {
+  u64 out = 0, bit = 1;
+  while (mask != 0) {
+    u64 low = mask & (0ull - mask);
+    if ((x & ${op === "pext" ? "low" : "bit"}) != 0) out |= ${op === "pext" ? "bit" : "low"};
+    mask &= mask - 1;
+    bit <<= 1;
+  }
+  return out;
+}
+
+INLINE u64 u64_${op}(u64 x, u64 mask) {
+#if !DEVICE && defined(__x86_64__) && !defined(BEND_U64_PORTABLE)
+#if defined(__BMI2__)
+  return _${op}_u64(x, mask);
+#else
+  if (__builtin_cpu_supports("bmi2")) return u64_${op}_bmi2(x, mask);
+#endif
+#endif
+  return u64_${op}_soft(x, mask);
+}
+`).join("\n")}
 
 // Metal folds a constant dividend within 128 of 2^32 through an f32: divide
 // its half, then fix the odd bit.
@@ -732,10 +816,7 @@ function let_live(cb: Carb, t: HLet): boolean[] {
   return t.q.map((_, j) => term_use(u, o.ps[j]) > 0);
 }
 
-// A term's application view: the annotated head `h`, the head `t`, its
-// TLD, every argument, the live ones, and the call the term is: the direct
-// call when the live arguments meet the def's, else, when over-applied or
-// on a variable, Clo.apply over the outermost live application.
+// Application spine: annotated/stripped heads, arguments and saturated call.
 function term_spine(cf: Carb, tm: HTerm): Spine {
   return memo(SPINES, tm, () => {
     const apps: Of<"App">[] = [];
@@ -812,10 +893,7 @@ function term_any(cf: Carb, t: HTerm, p: (s: HTerm, tail: boolean) => boolean,
   seen));
 }
 
-// The nodes of a term, its shared parts once. The fold's fuel is the size
-// of what an unfold adds, not a count of unfolds: a wide body and a narrow
-// one do not cost the same, and a loop whose bound is a literal folds every
-// turn, so counting unfolds alone unrolls the whole loop into its caller.
+// Fold fuel counts added nodes once, not unfolds; prevents literal-loop unrolling.
 function term_nodes(cf: Carb, t: HTerm): number {
   let n = 0;
   term_any(cf, t, () => (n += 1) < 0);
@@ -864,6 +942,12 @@ function live_dom([q]: Dom): boolean {
 
 function intr_of(c: Carb, k: Bend.Name, js = false): Intr | undefined {
   const tld = c.book.tlds[k];
+  // Recognize C-only U64 intrinsics during call analysis too, before ANF
+  // schedules a source implementation. JS keeps the exact Base definitions.
+  if (!c.js && !js && tld?.$ === "Def" && tld.b === true
+    && tld.i === undefined && u64_op(k) !== undefined) {
+    return U64_INTR;
+  }
   const it = tld?.$ === "Def" && tld.i === undefined && (tld.b || tld.v === null)
     ? OPERATIONS[eff_name(k)] : undefined;
   return it !== undefined && (js || it.C !== undefined || it.call === true)
@@ -931,9 +1015,7 @@ function ty_adt(book: Bend.Book, A: HTerm | null): HAdt | null {
   return t?.$ === "ADT" ? t : null;
 }
 
-// A type may hold a closure: a function, a variable or a stuck type, or a
-// datatype whose live fields may (walked once per datatype); a word type,
-// a quantity (List<&2, U32>) or a kind holds none.
+// Conservatively detect closures through live fields; scalar words hold none.
 function ty_clo(book: Bend.Book, A: HTerm | null,
   seen = new Set<Bend.Name>()): boolean {
   const t = ty_wnf(book, A);
@@ -953,9 +1035,7 @@ function ty_clo(book: Bend.Book, A: HTerm | null,
 // Lay
 // ===
 
-// An Array is a block, an IO.OP holds the foreign requests beyond its
-// constructors, and a datatype past WIDE words (a record nested K deep is
-// F^K) is a node: boxes. Memoized on the type's term, which a fill shares.
+// Box arrays, IO.OP and types exceeding WIDE; memoize by type term.
 function lay_of(book: Bend.Book, A: HTerm | null): Lay {
   const t = ty_adt(book, A);
   if (t === null) {
@@ -1140,9 +1220,7 @@ function quant_live(q: Bend.Quant): boolean {
 // Def
 // ===
 
-// A def's signature: its live parameters, the layouts a call passes (a
-// foreign def takes boxes and a continuation, Clo.apply a closure and
-// its argument) and its return layout (a box for those two).
+// Live argument and result layouts; foreign calls and Clo.apply use boxes.
 function sig_def(cb: Carb, k: Bend.Name): Sig {
   return memo(SIGS, k, () => {
     const tld = def_body(cb, k);
@@ -1229,14 +1307,7 @@ export function io_type(book: Bend.Book): HTerm | null {
   return xs?.length === 1 ? xs[0] : null;
 }
 
-// A pure main's value prints through a descriptor of its type, one node
-// per (type, boxed?) pair in cells: a word (0 U32, 1 F32, 2 Nat), 3 a
-// Char (boxed?), 4 a String, 5 an Eql, 6 an Array (element node, lgs), 7
-// a Data (boxed?, arms, then per arm its name, cid, field count and
-// (word offset, node) per field: offsets in the node for a boxed value,
-// inline for a flat one). A cell that is a name is the constructor's cid
-// on the C lane. Null for an IO main; a type the printer cannot walk (a
-// function, a Type, an erased or dependent field) refuses the build.
+// Build a recursive (type, boxed?) descriptor; reject unprintable pure results.
 function show_main(book: Bend.Book): Show | null {
   const main = book.tlds["main"];
   if (main?.$ !== "Def" || (main.v === null && main.i === undefined)
@@ -1417,11 +1488,8 @@ function def_body(cb: Carb, k: Bend.Name): TLD | undefined {
   return cb.book.tlds[k];
 }
 
-// The reachable defs, raised, with the bangs and call-site counts, and
-// each one's source summary (SRCS): what it refers to, what it calls (a
-// reference used as a value is no call; Clo.apply is never flat), and
-// whether it is flat: no fork, no bang call, self-calls in tail position.
-function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
+// Reachable raised definitions, call sites, bangs and flatness summaries.
+function carb_book(src: Bend.Book, roots: Bend.Name[], js = false): Carb {
   book_owned(src);
   [TELES, SRCS, NODES, LAYS, CYCLES, FLATS, SIGS, BRWS].forEach((m) =>
     m.clear());
@@ -1432,6 +1500,7 @@ function carb_book(src: Bend.Book, roots: Bend.Name[]): Carb {
     }
   }
   const cb: Carb = {
+    js,
     book: { ...src, tlds: { ...src.tlds } },
     bangs: new Set(),
     sites: new Map(),
@@ -1683,12 +1752,7 @@ function node_fields(fl: File, t: string, node: Lay,
 
 // Facts
 // =====
-// The emitter is the analysis. A def's boxed parameters start borrowed and
-// rooted (brwl); a rooted word at an owned position, a value nobody holds
-// lent to a parameter, or a parameter no holder asks to lend (lend) owns
-// it (own); an owned use of a value used later shares it and heats its
-// type (hot); a shared value of an erased parameter's type marks it
-// (poly). compile_book emits the book until a pass changes nothing.
+// Emit until ownership, borrowing, sharing and polymorphism facts stabilize.
 
 function facts_hot(fl: File, B: HTerm | null, force: boolean,
   local = false): void {
@@ -1745,9 +1809,7 @@ function facts_fam(fl: File, w: HTerm, local: boolean): boolean {
   return true;
 }
 
-// A hot constructor's fields are hot at this instantiation: a hot type's
-// once, a hot build's at its site. Its own erased binder is not the def's
-// parameter: a field typed by it is unknown, never poly.
+// Propagate hot fields per instantiation; constructor-erased binders are not poly.
 function facts_ctr(fl: File, c: Bend.Ctr, xs: HTerm[]): void {
   const own = ctr_tail(fl.book, c, xs).some((d) => !live_dom(d));
   ctr_doms(fl.book, c, xs).forEach((A) => facts_hot(fl, A, true, own));
@@ -1998,9 +2060,7 @@ function bind_pop(fl: File, x: HTerm): Val {
   return b.val;
 }
 
-// A shared box of a flat type (a closure's or a polymorphic def's result)
-// unboxes before its first share: its words copy, its node does not. The
-// fresh binding decides this once; a rebinding (seg_open) decides nothing.
+// Unbox flat shared results at the first binding, never at a rebinding.
 function bind_uses(fl: File, p: Probe, v: Val, rest: HTerm[], A: HTerm,
   fresh = true): void {
   const n = rest_use(fl, rest, p);
@@ -2071,11 +2131,7 @@ function emit_jump(fl: File, args: string[], k: Bend.Name): void {
   file_push(fl, `WL_AGAIN(${fl.seg.fid});`);
 }
 
-// A call's arguments, evaluated, then laid out as the def takes them. A
-// nested one is evaluated first, the Var ones among its later uses, the
-// owned ones popped before the borrowed ones are read (a twin keeps); a
-// read is not popped: a holder asks a lend, else val_own, and a dead rooted
-// one is let go.
+// Evaluate nested arguments first; pop owned arguments before reading borrows.
 function emit_args(fl: File, ck: Call, jump = false, fork = false): string[] {
   const brw = brw_of(fl, ck.k);
   ck.all.forEach((a, q) =>
@@ -2213,8 +2269,73 @@ function emit_dst(fl: File, lay: Lay, k = "v"): Val {
   return val_new(emit_hold(fl, lay.ks.map(() => "0"), k, lay.ks), lay);
 }
 
+// Native expressions use packed scalar operands; the table is also the
+// call-analysis allowlist. Only trusted Base definitions take this path.
+const U64_C: Record<string, string> = Object.assign(Object.create(null), {
+  ...Object.fromEntries("add:+ sub:- mul:* and:& or:| xor:^".split(" ")
+    .map((s) => { const [n, op] = s.split(":"); return [n, `($0 ${op} $1)`]; })),
+  ...Object.fromEntries("is_eq:== is_ne:!= is_lt:< is_le:<= is_gt:> is_ge:>="
+    .split(" ").map((s) => {
+      const [n, op] = s.split(":"); return [n, `($0 ${op} $1)`];
+    })),
+  // emit_alias may reuse a u32 local: widen before the result is split at bit 32.
+  from_u32: "((u64)(u32)$0)", from_parts: "((u64)$1 | ((u64)$0 << 32))",
+  low: "((u32)$0)", high: "((u32)($0 >> 32))",
+  inc: "($0 + 1ull)", not: "(~$0)", and_not: "($0 & ~$1)",
+  shl: "($0 << 1)", shr: "($0 >> 1)",
+  shln: "($1 >= 64 ? 0ull : ($0 << $1))",
+  shrn: "($1 >= 64 ? 0ull : ($0 >> $1))",
+  cmp: "(($0 > $1) + ($0 >= $1))",
+  is_zero: "($0 == 0)", is_odd: "(($0 & 1) != 0)",
+  bit: "($0 >= 64 ? 0ull : (1ull << $0))",
+  test_bit: "($1 < 64 && (($0 >> $1) & 1) != 0)",
+  set_bit: "($0 | ($1 >= 64 ? 0ull : (1ull << $1)))",
+  clear_bit: "($0 & ~($1 >= 64 ? 0ull : (1ull << $1)))",
+  toggle_bit: "($0 ^ ($1 >= 64 ? 0ull : (1ull << $1)))",
+  lsb: "($0 & (0ull - $0))", clear_lsb: "($0 & ($0 - 1ull))",
+  popcount: "u64_popcount($0)", popcnt: "u64_popcount($0)",
+  ctz: "u64_ctz($0)", clz: "u64_clz($0)",
+  pext: "u64_pext($0, $1)", pdep: "u64_pdep($0, $1)",
+});
+
+const U64_INTR: Intr = { u64: true, C: "",
+  JS: () => die("a C-only U64 intrinsic in a JS expression") };
+
+function u64_op(k: Bend.Name): string | undefined {
+  return k.startsWith("U64.") ? U64_C[k.slice(4)] : undefined;
+}
+
+// Pack only at this scalar boundary. Records, arrays, closures and returns
+// retain two w32 fields: unrestricted bits must never masquerade as Term tags.
+function emit_u64_c(fl: File, x: HTerm, ty: HTerm | null): Val {
+  const m = term_spine(fl, x);
+  const k = (m.t as Of<"Ref">).k;
+  const def = m.tld;
+  if (def?.$ !== "Def" || def.b !== true || def.i !== undefined || m.all.length !== def.n) {
+    die("an unsaturated or non-Base U64 intrinsic");
+  }
+  const sig = sig_def(fl, k);
+  const args = emit_each(fl, m.args, sig.lays).map((v, i) => {
+    const a = val_to(fl, v, sig.lays[i]);
+    const wide = ty_adt(fl.book, sig.live[i][2])?.k === "U64";
+    if (a.ws.length !== (wide ? 2 : 1)) die("a U64 intrinsic layout mismatch");
+    const e = wide ? `((u64)(u32)(${a.ws[0]}) | ((u64)(u32)(${a.ws[1]}) << 32))`
+      : val_word(a);
+    return emit_alias(fl, e, "u", "w64");
+  });
+  const T = ty ?? tele_unbind(fl.book, def.T).ret;
+  const e = tpl(u64_op(k) ?? die("an unknown U64 intrinsic"), args);
+  const wide = ty_adt(fl.book, T)?.k === "U64";
+  const u = wide ? emit_alias(fl, e, "u", "w64") : e;
+  return val_new(wide ? [`((u32)${u})`, `((u32)(${u} >> 32))`] : [u],
+    lay_of(fl.book, T));
+}
+
 function emit_intr(fl: File, it: Intr, x: HTerm,
   ty: HTerm | null): Val {
+  if (it.u64) {
+    return emit_u64_c(fl, x, ty);
+  }
   const m = term_spine(fl, x);
   const k = (m.t as Of<"Ref">).k;
   const args = emit_each(fl, m.args, null);
@@ -2550,12 +2671,7 @@ function emit_body(fl: File, tm: HTerm, ty0: HTerm | null,
   }
 }
 
-// A fork: in parallel a join task and a kid per call, or, for one call (a
-// cut), its continuation as the lane's task ahead of the jump; in sequence
-// (the emitter wound back) one frame read in place by every step, each
-// pushing its result, the last jumping into the joiner (a cut's one step
-// is its continuation). What the parallel join holds (hold) every step
-// holds too, so both paths open one joiner.
+// Parallel tasks and sequential frames share one joiner and its held values.
 function emit_fork(fl: File, x: HLet, ers: HTerm[]): void {
   const o = term_open(x);
   const calls = x.v.map((v) => call_kind(fl, v) as Call);
@@ -2677,10 +2793,7 @@ function emit_tab(fl: File, rows: Chain, ty: HTerm): number | null {
   return id;
 }
 
-// A match's rows: Nat counts Succ down its chain, each row a case or the
-// level's default with its residual; U32 walks the 32 bits of its patterns
-// and asks for half of 0..max, and one same row from every default a bit
-// falls off the walk to (a bit pattern's variable is a default too).
+// Collect Nat residual rows or U32 bit-pattern rows, including all defaults.
 function emit_lits(fl: File, x: HTerm, ty: HTerm, nat: boolean):
   Chain | null {
   if (nat) {
@@ -2855,11 +2968,7 @@ const TABLES = ["CID_ARITY_T", "CID_HOT_T", "FID_ARITY_T", "FID_FLAG_T", "FID_RE
 const RUNTIME_ADTS = ["Sigma", "String", "Word.Con", "IO.OP", "Result",
   "Maybe", "Bool", "Unit"];
 
-// The compiler knows base.bend's types by their names alone, and applies
-// a closure through CLO_APPLY, a def it synthesizes. SYNTH is the name no
-// file may declare; OWNED adds the types a file without `import Base` may
-// declare as its own, which check and run, and which the emitters, whose
-// native shape would not fit, refuse.
+// Reserve synthesized names; reject non-Base types that mimic native layouts.
 export const SYNTH = [CLO_APPLY];
 const OWNED = [...SYNTH, "IO", ...RUNTIME_ADTS, ...Object.keys(OPTIMIZED)];
 
@@ -3233,7 +3342,7 @@ function js_def(fl: File, k: Bend.Name, def: Def): void {
 
 export function js_lib(book: Bend.Book, roots: Bend.Name[],
   outs: Bend.Name[] | null): string {
-  const cb = carb_book(book, roots.slice());
+  const cb = carb_book(book, roots.slice(), true);
   const fl = file_new(cb, "const");
   fl.tab = 0;
   const ms = done_defs(cb).map(([k]) => js_sat(k));
@@ -3767,11 +3876,7 @@ INLINE Cls cls_fit(u32 words) {
 // Bank
 // ====
 
-// One stack of exact generations per class; 2 heap_words / max(CHUNK,
-// 2^c) entries cover the old ones plus a pass of returns. The host
-// pops and pushes at rd under bank_lock; a device pass pops down from
-// rd and pushes above top, and the host then compacts [top, wr) onto
-// rd, so a pass never sees what it handed.
+// Keep exact generations: host uses bank_lock; device returns become visible next pass.
 
 #define bank_at(H, c) ((DEV Bank*)((H) + H_BANK) + (c))
 
@@ -3805,22 +3910,8 @@ INLINE void bank_push(Corpus H, Cls c, Loc head) {
 // Heap
 // ====
 
-// Per lane and class (a tile row on the device): HOT, a LIFO chain of
-// free slots (word 0 the head it replaced); LEN, its exact length in
-// words, off the chain; on the host COLD, one generation. A free is a
-// push and an add. A host free at KEEP_WORDS (a slot for a wide class)
-// runs heap_hand: COLD to the bank, HOT parked as COLD, generations
-// exact. A miss takes COLD, else a bank entry, else a quantum of at
-// most a generation, and sets LEN to what it took: no adoption past a
-// generation, no list re-aged. A device lane keeps its frees for the
-// pass; at the kernel end dev_cut hands its complete generations,
-// walking only those. KEEP_WORDS is CAP_WORDS, or CHUNK with the GPU
-// (fixed at boot), so a device lane may adopt every host entry.
-// Bounds: a host lane and class under 2 max(KEEP_WORDS, 2^c) words, a
-// device one under max(CHUNK, 2^c) after each kernel plus its own
-// frees within one, bank entries exact. The bump grows only when this
-// lane's HOT and COLD and the class's bank are empty. A zero row is an
-// empty lane.
+// Per lane/class: HOT free chain, exact LEN, host COLD generation.
+// Bump only after HOT, COLD and bank miss; dev_cut returns complete generations.
 
 #define ALC_AT(e, i)   (e).alc[(i) * LANE_STEP]
 #define ALC_LEN(e, c)  ALC_AT(e, ALC_WORDS + (c))
@@ -4147,16 +4238,8 @@ INLINE Term term_word(Env e, Term w) {
 // Blk
 // ===
 
-// A block owns one allocation in its physical class (an ARR of class
-// c 2^c Terms in 2^c words, a BUF 2^c u32 in 2^buf_wcls(c) words) and
-// blk_free returns it there. A match on ANode is blk_half twice: each
-// half allocated in its class and copied, the source freed shallow by
-// the high call (its elements moved; the emitter binds the low half
-// first). ANode{l, r} is blk_node: the merged class, l and r copied
-// and freed shallow. Array.clone is blk_copy: a BUF raw, an ARR's
-// elements retained through blk_keep. A match to the leaves copies
-// O(n log n) words where a view copied none; get, set, swap, size and
-// new open no half.
+// Free in the physical class. Split/join move elements; clone retains ARR elements.
+// ANode elimination binds the low half before the high half frees the source.
 
 #define BLK_ALLOC(n, w) \
   Loc n = heap_alloc(e, w); \
@@ -4520,9 +4603,7 @@ static Reply work_loop(Env e, Stk sp, Term t, bool seq) {
 // Monk
 // ====
 
-// One turn on a ring: its head task below put0 runs (a growing lane skips
-// a fork-free one). The host grows a row ring by ring and works a ring
-// until it drains; a device lane does both.
+// Run a ring head below put0; growing lanes skip fork-free tasks.
 INLINE u32 monk_step(Env e, Stk stk, Ring rg, u32 put0, bool seq, u32 base,
   u32 stride, Cur cur) {
   Corpus   H   = e.mem;
@@ -4564,10 +4645,7 @@ INLINE u32 monk_step(Env e, Stk stk, Ring rg, u32 put0, bool seq, u32 base,
 // Dev
 // ===
 
-// TG_HOLD words of threadgroup memory (lane 0's write keeps them) hold
-// one group per Apple core: without them bitonic runs 1.35x, kmeans
-// 1.19x, matmul 1.13x. A grow pass runs at most CUBE_T rounds, so a group
-// that never fills still cuts at a kernel end.
+// TG_HOLD limits occupancy; grow passes stop within CUBE_T rounds.
 
 #if DEVICE
 
@@ -4612,10 +4690,7 @@ INLINE void bank_pack(Corpus H, u32 lane) {
   }
 }
 
-// One kernel, one pipeline: pass 0 grows the frontier (a task a lane a
-// turn, votes between barriers), pass 1 works it (a lane drains its
-// ring), pass 2 packs the banks; one call of monk_step, so the program
-// compiles once.
+// One compiled kernel: pass 0 grows, 1 drains rings, 2 packs banks.
 #ifdef __METAL_VERSION__
 kernel void bend_dev(Corpus H [[buffer(0)]], constant u32& pass [[buffer(1)]],
   threadgroup volatile u64* hold [[threadgroup(0)]],
@@ -4690,11 +4765,7 @@ extern "C" __global__ void bend_dev(Corpus H, u32 pass) {
 // Window
 // ======
 
-// The Linux kit's fill, the Mac's window_msl in the runtime's dialect:
-// a ! build carries window_dev in its cubin, a host build walks the
-// pixels itself. An Image is a quadtree over 2^k x 2^k: a Qua at level
-// i splits its square in four (tl, tr, bl, br), a Qua under the pixels
-// follows tl, a Pix is 0xRRGGBB.
+// Shared host/device quadtree fill; below pixel depth follow tl. Pix is 0xRRGGBB.
 #if defined(__linux__) || defined(__CUDACC_RTC__)
 
 INLINE u32 window_pix(Corpus H, Term t, u32 k, u32 x, u32 y) {
@@ -4881,12 +4952,7 @@ OUTLINE void pool_turn(bool grow) {
 // Gpu
 // ===
 
-// gpu_make compiles the device program and, given a path, writes it as
-// <binary>.gpu (--gpu-build, run by bend -o): Metal's binary archive
-// of the pipeline (keyed by the compiled function, so a wrong file
-// misses), CUDA's cubin behind a hash of the text. A launch loads it,
-// else notes and compiles (Metal's OS cache keeps that pipeline; CUDA
-// writes the file).
+// Cache Metal pipeline archives or source-hashed CUDA cubins in <binary>.gpu.
 
 static const char* gpu_path(void) {
   static char path[4096];
@@ -5026,10 +5092,7 @@ static void gpu_pass(u32 f) {
 
 #elif BEND_CUDA
 
-// the bag from the device: a group of 128 lanes per 64 KB of L2, a power of
-// two from 16 to 128 groups. Apple keeps the 128 the bag was tuned on: on an
-// M4 (10 cores) 32 groups ran bitonic 1.85 -> 1.29 s, but the light one-pass
-// benches 1.25x, their lanes four times fewer.
+// CUDA sizes groups from L2; Apple keeps the tuned 128-group shape.
 static void gpu_shape(int units) {
   CUBE_LOG = 31 - CLZ(units < 16 ? 16 : units > 128 ? 128 : units);
 }
@@ -5205,10 +5268,7 @@ static void cube_run(Corpus H, bool gpu) {
 // Corpus
 // ======
 
-// The cores map 8 GiB at a high base and double it in place, a hint then
-// a check (MAP_FIXED would replace a neighbour), so one base holds every
-// Loc and a run pays for the room it reaches. The banks lie past the pages
-// and move up at each step. The GPU maps its whole span once.
+// Grow the CPU mapping in place, never MAP_FIXED over neighbors; GPU maps once.
 
 static u64 corpus_size;
 
@@ -5343,10 +5403,7 @@ OUTLINE Term corpus_eval(Corpus H, Term t) {
 #define IO_TIME 2
 #define IO_PARK TERM_HOLE
 
-// A handle is its host value, a descriptor or a pointer, packed in one
-// word (a pointer split over the aux and loc bits). Its type is a law of
-// base, opaque and linear: a program cannot forge, copy or reuse one, so
-// nothing stands between the value and the host.
+// Opaque linear handles pack a descriptor/pointer across aux and loc bits.
 #define io_hand(v)   term_make(TAG_PAK, (u64)(v) >> 40, (u64)(v) & LOC_MASK)
 #define io_hand_v(t) (((u64)term_aux(t) << 40) | term_loc(t))
 
@@ -5421,12 +5478,7 @@ static u64 io_sys_end(IoWork* w, ssize_t n) {
   return n < 0 ? 0 : (u64)n;
 }
 
-// A computation's activation for its whole life: cont over item is its
-// next request; parked, work.word and time are its fd and deadline, evts
-// what the fd must be ready for, and work.pack resumes it (io_exec runs
-// cont, the request); work leads, so an effect's IoWork* is its activation.
-// IoAct ::=
-//   | IoAct(work, cont, item, time, evts, next)
+// Lifetime activation: work leads; cont/item resume, fd/deadline/events park.
 typedef struct IoAct {
   IoWork        work;
   Term          cont;
@@ -5467,10 +5519,7 @@ static void io_spawn(Term m) {
   io_live += 1;
 }
 
-// Parks the effect's activation until fd is ready for evts (POLLIN or
-// POLLOUT; 0 for no fd), or until time (a tick; 0 for no deadline),
-// whichever comes first; the loop then calls more on its thread, whose
-// value readies the activation, or IO_PARK, a re-park.
+// Resume on fd readiness or deadline; more may return IO_PARK to re-park.
 static Term io_wait_on(IoWork* w, int fd, short evts, u64 time, IoPack more) {
   IoAct* a     = (IoAct*)w;
   a->work.word = (u32)fd;
@@ -5548,9 +5597,7 @@ static Term io_node(Env e, u64 cid, Term a, Term b) {
   return term_ctr(cid, l);
 }
 
-// io_str decodes UTF-8 as WHATWG does: the lead byte sets the count of
-// continuation bytes and the range of the second; a byte that breaks the
-// sequence (or the end) yields one U+FFFD and is read again as a lead.
+// WHATWG UTF-8: invalid sequences emit U+FFFD and reprocess the offending byte.
 static Term io_str(Env e, const char* p, u64 n) {
   Term s    = term_pak(CID_SNIL, 0);
   Loc  hole = 0;
@@ -5736,10 +5783,7 @@ ${NATIVE.IO}
 
 #if MAIN_PURE
 
-// A pure main's value, spelled as term_show spells it: d is a node of
-// SHOW_DESC (see show_main), w the value's words. A boxed Data reads its
-// arm by cid off a Term (packed, or a node), an inline one by tag off
-// its words.
+// Print from the type descriptor; see show_main and the descriptor notes.
 static void show_val(Env e, u32 d, const Term* w, char chain);
 
 // char_show: an escape, a \u{hex}, else the code point in UTF-8
@@ -5963,9 +6007,7 @@ typedef struct {
   IoQue wait;
 } ChanRow;
 
-// A channel is Data: its handle is copied and may outlive the row, so it
-// names the row by index and generation, a freed row waits on a list and
-// comes back one generation up, and a stale copy finds no row (closed).
+// Index/generation handles may outlive rows; generation changes reject stale copies.
 static ChanRow* chan_rows;
 static u32      chan_len;
 static u32      chan_idle = ~0u;
@@ -6009,8 +6051,7 @@ static ChanRow* chan_at(Term t) {
   return row != NULL && row->live && row->gen == (u32)(v >> 24) ? row : NULL;
 }
 
-// Parks the effect's activation on row with item: a sent value, or
-// TERM_HOLE for a receiver.
+// Resume on fd readiness or deadline; more may return IO_PARK to re-park.
 static Term chan_park(ChanRow* row, IoWork* w, Term item) {
   IoAct* a = (IoAct*)w;
   a->item  = item;
@@ -6224,9 +6265,7 @@ function show_chr(c, q) {
     ? "\\u{" + c.toString(16) + "}" : String.fromCodePoint(c);
 }
 
-// A pure main's value, spelled as term_show spells it: d is a node of
-// the descriptor D over the names N (see show_main), v the value, chain
-// the bracket of the [a, b] or (a, b) it continues, or 0.
+// Print from the type descriptor; see show_main and the descriptor notes.
 function show_val(D, N, d, v, chain) {
   if (D[d] === 7) {
     const fs = Object.values(typeof v === "boolean"
@@ -6307,9 +6346,7 @@ function io_sys() {
     const err = mac ? "__error" : "__errno_location";
     const T = { i: "i32", u: "u32", U: "u64", I: "i64", p: "ptr",
       c: "cstring" };
-    // fcntl is variadic. Apple arm64 passes variadic arguments on the
-    // stack, where the fixed convention puts arguments past the eighth, so
-    // there the flags ride as a ninth argument; elsewhere in a register.
+    // On Apple arm64, pass variadic flags on the stack as the ninth argument.
     const vari = mac && process.arch === "arm64";
     const lib = ffi.dlopen(mac ? "libSystem.dylib" : "libc.so.6",
       Object.fromEntries(("socket:iii>i bind:ipu>i listen:ii>i connect:ipu>i"
