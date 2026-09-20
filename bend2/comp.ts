@@ -2253,7 +2253,7 @@ const U64_C: Record<string, string> = Object.assign(Object.create(null), {
     .split(" ").map((s) => {
       const [n, op] = s.split(":"); return [n, `($0 ${op} $1)`];
     })),
-  from_u32: "$0", from_parts: "((u64)$1 | ((u64)$0 << 32))",
+  from_u32: "((u64)$0)", from_parts: "((u64)$1 | ((u64)$0 << 32))",
   low: "((u32)$0)", high: "((u32)($0 >> 32))",
   inc: "($0 + 1ull)", not: "(~$0)", and_not: "($0 & ~$1)",
   shl: "($0 << 1)", shr: "($0 >> 1)",
