@@ -72,10 +72,11 @@ suite also imports the full proof module via `tests/proof/u64_laws.bend`.
 
 ## CI and failure controls
 
-`.github/workflows/u64-correctness.yml` runs source proofs and native/reference
-agreement as separate jobs. The proof gate also verifies rejection of a
-missing proof, the false bound of 63, a missing LAWS import, a proof hole,
-an unsafe proof, and a corrupted source-level high-half conversion.
+`.github/workflows/u64-correctness.yml` runs four independent jobs: source
+proofs, native/reference agreement, repository budgets, and strict TypeScript.
+The proof gate verifies seven rejection controls: a missing proof, the false
+bound of 63, a missing LAWS import, a proof hole, an unsafe proof, a corrupted
+source-level high-half conversion, and a cyclic template instance.
 
 Bend can return status 0 with an unsafe/foreign dependency warning. The gate
 therefore requires both a successful status and the exact clean success
@@ -91,12 +92,33 @@ GitHub branch protection; repository administrators control that policy.
 These are source-level proofs, checked by Bend's existing kernel. They are
 not a proof of the TypeScript compiler, the C compiler, the CPU instructions,
 or an entire chess engine. Native code generation is still trusted and
-independently tested. The fork remains experimental; its existing strict
-TypeScript diagnostic and compiler source-token budget failure are not fixed
-or hidden by these additional checks. No existing source-token cap is raised.
+independently tested. The fork remains experimental. The compiler source-token
+budget failure is resolved without raising any existing cap; inherited strict
+TypeScript failures remain visible in a separate CI job.
 
 Still separate work: general arithmetic/scanning laws, attack-table contents,
 legal move generation, perft and make/unmake correctness, and end-to-end
 compiler verification. In particular, this module does not claim that PEXT
 constructs a correct chess attack table merely because its round trip is
 proved. GPU and ARM execution remain outside the completed validation.
+
+## Repository checks
+
+`bun tests/run/u64_repo.js` runs the unchanged file budgets plus failure
+controls for the token counter. Long compiler explanations now live in
+`guide/COMPILER.md`; no executable compiler code was moved or changed by
+that documentation cleanup. The compiler is below its existing 64,000-token cap.
+
+The permanent workflow also runs strict TypeScript checking separately.
+The pinned upstream checker (`6018e28ecc67cf1fffc0c20c64b11023474c2df8`)
+produces TS2339 at `bend2/bend.ts` lines 2084 and 3751. The full configured
+project also reports missing `canvas` module declarations in `gen_anim.ts`
+and `gen_gifs.ts`. All four diagnostics and the failing exit status match the
+exact upstream tree with the same dependencies. The human-maintained checker
+is kept byte-for-byte upstream, and none of these diagnostics is suppressed.
+Passing source proofs, native tests or the repository-size gate does not mean
+that strict TypeScript passes.
+
+The proof gate additionally rejects upstream #902's cyclic template instance,
+which otherwise could inhabit `Empty` and prove a false equality. Native
+regressions include all nine new or updated upstream fixtures from this sync.

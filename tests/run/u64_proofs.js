@@ -103,6 +103,13 @@ try {
   assert.match(broken.text, /expected[\s\S]*observed/);
   report.push({ negative: 'corrupted-high-half', rejected: true });
 
+  // Upstream #902 could inhabit Empty through a cycle of template instances.
+  // Source-level laws are meaningful only when that false proof is rejected.
+  const cyclic = invoke(path.join(root, 'tests/check/template_inst_cycle.bend'));
+  assert.equal(cyclic.status, 1, 'A template cycle must not prove False == True');
+  assert.match(cyclic.text, /expected : a decreasing self-call/);
+  report.push({ negative: 'template-instance-cycle', rejected: true });
+
   console.log(JSON.stringify({ proof_gate: 'PASS', report }, null, 2));
 } finally {
   fs.rmSync(temp, { recursive: true, force: true });
